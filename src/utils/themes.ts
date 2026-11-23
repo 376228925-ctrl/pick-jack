@@ -32,7 +32,7 @@ export const SCENIC_THEMES: ScenicThemeConfig[] = [
     courtOuterHex: '#2A6F97',
     courtInnerHex: '#D96B59',
     courtKitchenHex: '#B85244',
-    defaultPosterTheme: 'night_slam',
+    defaultPosterTheme: 'magazine',
   },
   {
     id: 'botanical',
@@ -47,7 +47,7 @@ export const SCENIC_THEMES: ScenicThemeConfig[] = [
     courtOuterHex: '#173F2E',
     courtInnerHex: '#236B4B',
     courtKitchenHex: '#1A5239',
-    defaultPosterTheme: 'swiss_ticket',
+    defaultPosterTheme: 'polaroid',
   },
   {
     id: 'terracotta',
@@ -62,7 +62,7 @@ export const SCENIC_THEMES: ScenicThemeConfig[] = [
     courtOuterHex: '#7C341E',
     courtInnerHex: '#BC4E2A',
     courtKitchenHex: '#9A3B1D',
-    defaultPosterTheme: 'roland_clay',
+    defaultPosterTheme: 'magazine',
   },
   {
     id: 'midnight',
@@ -77,7 +77,7 @@ export const SCENIC_THEMES: ScenicThemeConfig[] = [
     courtOuterHex: '#081F52',
     courtInnerHex: '#1441A2',
     courtKitchenHex: '#0C2A6E',
-    defaultPosterTheme: 'night_slam',
+    defaultPosterTheme: 'obsidian_gold',
   },
 ];
 

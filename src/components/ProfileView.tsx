@@ -1,18 +1,24 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   Calendar,
+  Camera,
   Check,
+  Cloud,
   Edit3,
   History,
   Loader2,
   LogIn,
   LogOut,
+  MessageCircle,
   Palette,
+  RefreshCw,
   Shield,
   ShieldCheck,
   Sparkles,
+  Upload,
   UserPlus,
+  X,
 } from 'lucide-react';
 import type { Gender, TournamentState, UserAccount } from '../types/tournament';
 import {
@@ -21,6 +27,7 @@ import {
   type CareerReviewResult,
 } from '../utils/aiAnalysis';
 import { canManageAdmins, getRoleLabel } from '../utils/authStore';
+import { compressAvatarFile, PRESET_AVATARS } from '../utils/avatarUtils';
 import { extractPersonalHistory } from '../utils/sessionArchive';
 import { SCENIC_THEMES, type ScenicThemeId } from '../utils/themes';
 
@@ -29,8 +36,13 @@ interface ProfileViewProps {
   allUsers: UserAccount[];
   sessions: TournamentState[];
   activeTheme: ScenicThemeId;
+  cloudSyncStatus: 'idle' | 'syncing' | 'synced' | 'local_only';
+  onSyncClubCloud: () => void;
   onSelectTheme: (id: ScenicThemeId) => void;
-  onLogin: (username: string, password: string) => { ok: boolean; error?: string };
+  onLogin: (
+    username: string,
+    password: string
+  ) => Promise<{ ok: boolean; error?: string }> | { ok: boolean; error?: string };
   onRegister: (input: {
     username: string;
     password: string;
@@ -40,12 +52,13 @@ interface ProfileViewProps {
   }) => { ok: boolean; error?: string };
   onLogout: () => void;
   onUpdateProfile: (patch: {
-    displayName: string;
-    gender: Gender;
-    dupr: number;
-    handedness: 'right' | 'left';
-    playStyle: string;
-    bio: string;
+    displayName?: string;
+    avatarUrl?: string;
+    gender?: Gender;
+    dupr?: number;
+    handedness?: 'right' | 'left';
+    playStyle?: string;
+    bio?: string;
   }) => void;
   onToggleUserAdmin: (targetUserId: string, nextRole: 'admin' | 'member') => void;
   onJumpToSession: (sessionId: string) => void;
@@ -56,6 +69,8 @@ export function ProfileView({
   allUsers,
   sessions,
   activeTheme,
+  cloudSyncStatus,
+  onSyncClubCloud,
   onSelectTheme,
   onLogin,
   onRegister,
@@ -72,6 +87,18 @@ export function ProfileView({
   const [regDupr, setRegDupr] = useState(3.5);
   const [authError, setAuthError] = useState<string | null>(null);
 
+  // Avatar picker & WeChat OAuth state
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [avatarPickerOpen, setAvatarPickerOpen] = useState(false);
+  const [avatarUploading, setAvatarUploading] = useState(false);
+  const [avatarError, setAvatarError] = useState<string | null>(null);
+  const [wechatStatus, setWechatStatus] = useState<{
+    configured: boolean;
+    callbackUrl?: string;
+  }>({ configured: false });
+  const [wechatGuideOpen, setWechatGuideOpen] = useState(false);
+  const [wechatLoading, setWechatLoading] = useState(false);
+
   // Edit profile state
   const [editing, setEditing] = useState(false);
   const [editName, setEditName] = useState('');
@@ -85,6 +112,20 @@ export function ProfileView({
   const [reviewLoading, setReviewLoading] = useState(false);
   const [reviewError, setReviewError] = useState<string | null>(null);
   const [review, setReview] = useState<CareerReviewResult | null>(null);
+
+  useEffect(() => {
+    fetch('/api/wechat-auth?action=status')
+      .then((r) => r.json())
+      .then((data: { configured?: boolean; callbackUrl?: string }) => {
+        setWechatStatus({
+          configured: Boolean(data.configured),
+          callbackUrl: data.callbackUrl,
+        });
+      })
+      .catch(() => {
+        setWechatStatus({ configured: false });
+      });
+  }, []);
 
   const personalHistory = useMemo(() => {
     if (!currentUser) {
@@ -101,11 +142,11 @@ export function ProfileView({
     return extractPersonalHistory(sessions, [currentUser.displayName, currentUser.username]);
   }, [currentUser, sessions]);
 
-  const handleAuthSubmit = (e: React.FormEvent) => {
+  const handleAuthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError(null);
     if (authMode === 'login') {
-      const res = onLogin(username, password);
+      const res = await onLogin(username, password);
       if (!res.ok) {
         setAuthError(res.error || '登录失败');
       } else {
@@ -128,6 +169,53 @@ export function ProfileView({
       setUsername('');
       setPassword('');
       setRegDisplayName('');
+      setAuthMode('login');
+    }
+  };
+
+  const handleAvatarFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setAvatarUploading(true);
+    setAvatarError(null);
+    try {
+      const dataUrl = await compressAvatarFile(file, 240);
+      onUpdateProfile({ avatarUrl: dataUrl });
+      setAvatarPickerOpen(false);
+    } catch (err) {
+      setAvatarError(err instanceof Error ? err.message : '头像处理失败');
+    } finally {
+      setAvatarUploading(false);
+    }
+  };
+
+  const handleWeChatSyncClick = async () => {
+    if (!wechatStatus.configured) {
+      setWechatGuideOpen(true);
+      return;
+    }
+    setWechatLoading(true);
+    try {
+      const res = await fetch('/api/wechat-auth?action=url');
+      const data = (await res.json()) as { ok?: boolean; url?: string };
+      if (data.ok && data.url) {
+        const isWeChatBrowser = /MicroMessenger/i.test(navigator.userAgent);
+        if (isWeChatBrowser) {
+          window.location.href = data.url;
+        } else {
+          const popup = window.open(data.url, 'wechat_oauth', 'width=540,height=680');
+          if (!popup) {
+            setWechatGuideOpen(true);
+          }
+        }
+      } else {
+        setWechatGuideOpen(true);
+      }
+    } catch {
+      setWechatGuideOpen(true);
+    } finally {
+      setWechatLoading(false);
     }
   };
 
@@ -198,14 +286,40 @@ export function ProfileView({
 
   return (
     <div className="space-y-6">
-      {/* Scenic Theme Quick Bar inside Profile */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        onChange={handleAvatarFileChange}
+        className="hidden"
+        aria-label="上传个人头像图片"
+      />
+
+      {/* Scenic Theme Quick Bar + Cloud Sync Pill */}
       <section className="theme-glass border rounded-3xl p-4 sm:p-5 space-y-3">
-        <div className="flex items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-1.5 text-sm font-bold text-white">
             <Palette className="w-4 h-4 theme-accent-text" aria-hidden="true" />
             <span>实景氛围主题</span>
           </div>
-          <span className="text-xs text-white/60">点击即刻切换背景摄影与全局色调</span>
+          <button
+            type="button"
+            onClick={onSyncClubCloud}
+            className="min-h-[32px] px-3 rounded-xl bg-black/30 border border-white/15 text-[11px] font-semibold text-white/85 hover:bg-black/45 inline-flex items-center gap-1.5 cursor-pointer"
+          >
+            {cloudSyncStatus === 'syncing' ? (
+              <RefreshCw className="w-3.5 h-3.5 animate-spin theme-accent-text" aria-hidden="true" />
+            ) : (
+              <Cloud className="w-3.5 h-3.5 theme-accent-text" aria-hidden="true" />
+            )}
+            <span>
+              {cloudSyncStatus === 'synced'
+                ? '云端 KV 已互通 · 点此刷新'
+                : cloudSyncStatus === 'syncing'
+                ? '云端同步中…'
+                : '同步云端俱乐部数据'}
+            </span>
+          </button>
         </div>
 
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
@@ -250,12 +364,12 @@ export function ProfileView({
       {!currentUser ? (
         <section className="max-w-lg mx-auto theme-glass-strong border rounded-3xl p-5 sm:p-7 space-y-5">
           <div className="space-y-1">
-            <p className="text-xs font-bold theme-accent-text">个人档案 · 历史局隔离 · 权限认证</p>
+            <p className="text-xs font-bold theme-accent-text">个人档案 · 云端互通 · 权限认证</p>
             <h1 className="text-xl sm:text-2xl font-extrabold text-white">
               {authMode === 'login' ? '登录你的球手账号' : '注册新球手档案'}
             </h1>
             <p className="text-xs text-white/70">
-              登录后自动隔离展示你的跨日期历史战绩、开启 DeepSeek 个人 AI 复盘，管理员可发布每日赛局。
+              登录后可自定义头像、跨手机同步个人历史局、开启 DeepSeek 个人 AI 复盘。
             </p>
           </div>
 
@@ -399,6 +513,21 @@ export function ProfileView({
             </button>
           </form>
 
+          {/* WeChat One-Tap Auth Entry */}
+          <button
+            type="button"
+            onClick={handleWeChatSyncClick}
+            disabled={wechatLoading}
+            className="w-full min-h-[44px] rounded-xl bg-[#07C160]/18 hover:bg-[#07C160]/28 border border-[#07C160]/45 text-[#8CF0B6] text-xs font-bold flex items-center justify-center gap-2 cursor-pointer transition-colors"
+          >
+            {wechatLoading ? (
+              <Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" />
+            ) : (
+              <MessageCircle className="w-4 h-4" aria-hidden="true" />
+            )}
+            <span>微信一键授权获取头像与昵称</span>
+          </button>
+
           {authMode === 'login' && (
             <div className="pt-3 border-t border-white/10 text-xs text-white/65 space-y-1">
               <p>内置测试球友账号（密码均为 123456）：</p>
@@ -425,16 +554,35 @@ export function ProfileView({
           )}
         </section>
       ) : (
-        /* LOGGED IN: Personal Profile + Isolated Match History + AI Career Review + Super Admin RBAC */
+        /* LOGGED IN: Athlete Profile + Avatar Studio + History + AI Career Review + RBAC */
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-          {/* Left Column: Athlete Profile Card + Super Admin Panel */}
+          {/* Left Column */}
           <div className="lg:col-span-5 space-y-5">
             <section className="theme-glass-strong border rounded-3xl p-5 sm:p-6 space-y-4">
               <div className="flex items-start justify-between gap-3">
                 <div className="flex items-center gap-3.5 min-w-0">
-                  <div className="w-14 h-14 rounded-2xl theme-accent-bg flex items-center justify-center text-xl font-extrabold shrink-0 shadow-lg">
-                    {currentUser.displayName.slice(0, 1).toUpperCase()}
-                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setAvatarPickerOpen((v) => !v)}
+                    aria-label="更换个人头像"
+                    className="relative group w-16 h-16 rounded-2xl overflow-hidden shrink-0 shadow-lg border-2 border-white/25 hover:border-[var(--theme-accent)] transition-all cursor-pointer"
+                  >
+                    {currentUser.avatarUrl ? (
+                      <img
+                        src={currentUser.avatarUrl}
+                        alt={currentUser.displayName}
+                        className="w-full h-full object-cover"
+                      />
+                    ) : (
+                      <div className="w-full h-full theme-accent-bg flex items-center justify-center text-2xl font-extrabold">
+                        {currentUser.displayName.slice(0, 1).toUpperCase()}
+                      </div>
+                    )}
+                    <div className="absolute inset-0 bg-black/45 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                      <Camera className="w-5 h-5 text-white" aria-hidden="true" />
+                    </div>
+                  </button>
+
                   <div className="min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
                       <h1 className="text-xl font-extrabold text-white truncate">
@@ -449,6 +597,14 @@ export function ProfileView({
                       @{currentUser.username} · DUPR {currentUser.dupr.toFixed(1)} ·{' '}
                       {currentUser.handedness === 'left' ? '左手拍' : '右手拍'}
                     </p>
+                    <button
+                      type="button"
+                      onClick={() => setAvatarPickerOpen((v) => !v)}
+                      className="mt-1.5 inline-flex items-center gap-1 text-[11px] font-semibold theme-accent-text hover:underline cursor-pointer"
+                    >
+                      <Camera className="w-3 h-3" aria-hidden="true" />
+                      <span>{avatarPickerOpen ? '收起头像工坊' : '设置/上传头像（同步画报）'}</span>
+                    </button>
                   </div>
                 </div>
 
@@ -462,6 +618,86 @@ export function ProfileView({
                   <span>退出</span>
                 </button>
               </div>
+
+              {/* Avatar Picker Drawer */}
+              {avatarPickerOpen && (
+                <div className="rounded-2xl bg-black/35 border border-white/15 p-3.5 space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-bold text-white">选择球手头像</span>
+                    <button
+                      type="button"
+                      onClick={() => setAvatarPickerOpen(false)}
+                      aria-label="关闭头像面板"
+                      className="text-white/60 hover:text-white cursor-pointer"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={avatarUploading}
+                      className="min-h-[40px] px-3 rounded-xl theme-accent-bg text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      {avatarUploading ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+                      ) : (
+                        <Upload className="w-3.5 h-3.5" aria-hidden="true" />
+                      )}
+                      <span>相册上传头像</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={handleWeChatSyncClick}
+                      disabled={wechatLoading}
+                      className="min-h-[40px] px-3 rounded-xl bg-[#07C160]/20 hover:bg-[#07C160]/30 border border-[#07C160]/45 text-[#8CF0B6] text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <MessageCircle className="w-3.5 h-3.5" aria-hidden="true" />
+                      <span>微信获取头像</span>
+                    </button>
+                  </div>
+
+                  {avatarError && (
+                    <p role="alert" className="text-[11px] text-[#FFB0A0]">
+                      {avatarError}
+                    </p>
+                  )}
+
+                  <div className="space-y-1.5">
+                    <div className="text-[11px] text-white/60">或直接选用俱乐部质感插画头像：</div>
+                    <div className="grid grid-cols-6 gap-2">
+                      {PRESET_AVATARS.map((preset) => {
+                        const selected = currentUser.avatarUrl === preset.dataUrl;
+                        return (
+                          <button
+                            key={preset.id}
+                            type="button"
+                            onClick={() => {
+                              onUpdateProfile({ avatarUrl: preset.dataUrl });
+                              setAvatarPickerOpen(false);
+                            }}
+                            title={preset.label}
+                            className={`aspect-square rounded-xl overflow-hidden border-2 transition-all cursor-pointer ${
+                              selected
+                                ? 'border-[var(--theme-accent)] scale-105'
+                                : 'border-white/15 hover:border-white/50'
+                            }`}
+                          >
+                            <img
+                              src={preset.dataUrl}
+                              alt={preset.label}
+                              className="w-full h-full object-cover"
+                            />
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              )}
 
               <div className="rounded-2xl bg-black/25 border border-white/10 p-3.5 text-xs space-y-1.5">
                 <div className="text-white/90 font-semibold">球风标签：{currentUser.playStyle}</div>
@@ -570,17 +806,33 @@ export function ProfileView({
             {/* Super Admin Exclusive Role Management Panel */}
             {isSuperAdmin && (
               <section className="theme-glass-strong border rounded-3xl p-5 space-y-3.5">
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-1.5 text-sm font-bold text-white">
-                    <Shield className="w-4 h-4 theme-accent-text" aria-hidden="true" />
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 text-sm font-bold text-white whitespace-nowrap">
+                    <Shield className="w-4 h-4 theme-accent-text shrink-0" aria-hidden="true" />
                     <span>超级管理员 · 权限分配</span>
                   </div>
-                  <span className="text-[11px] font-mono text-white/60">
-                    共 {allUsers.length} 位用户
-                  </span>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span className="text-[11px] font-mono text-white/60 whitespace-nowrap">
+                      共 {allUsers.length} 位用户
+                    </span>
+                    <button
+                      type="button"
+                      onClick={onSyncClubCloud}
+                      disabled={cloudSyncStatus === 'syncing'}
+                      className="min-h-[30px] px-2.5 rounded-lg bg-white/10 hover:bg-white/20 text-[11px] font-semibold text-white inline-flex items-center gap-1 whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-60"
+                    >
+                      <RefreshCw
+                        className={`w-3 h-3 theme-accent-text shrink-0 ${
+                          cloudSyncStatus === 'syncing' ? 'animate-spin' : ''
+                        }`}
+                        aria-hidden="true"
+                      />
+                      <span>刷新云端</span>
+                    </button>
+                  </div>
                 </div>
                 <p className="text-xs text-white/70">
-                  由 Jack 授权为「赛事管理员」的用户，可在日历中发布每日新赛局与赛制规则。
+                  由 Jack 授权为「赛事管理员」的用户，可在日历中发布每日新赛局与赛制规则（已接入 KV 云端同步）。
                 </p>
 
                 <div className="divide-y divide-white/10">
@@ -589,15 +841,28 @@ export function ProfileView({
                       key={u.id}
                       className="py-2.5 flex items-center justify-between gap-3 text-xs"
                     >
-                      <div className="min-w-0">
-                        <div className="font-bold text-white truncate">
-                          {u.displayName}{' '}
-                          <span className="font-mono font-normal text-white/55">
-                            @{u.username}
-                          </span>
-                        </div>
-                        <div className="text-[11px] text-white/65">
-                          {getRoleLabel(u.role)} · DUPR {u.dupr.toFixed(1)}
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        {u.avatarUrl ? (
+                          <img
+                            src={u.avatarUrl}
+                            alt={u.displayName}
+                            className="w-8 h-8 rounded-full object-cover shrink-0 border border-white/20"
+                          />
+                        ) : (
+                          <div className="w-8 h-8 rounded-full bg-white/12 flex items-center justify-center text-xs font-bold text-white shrink-0">
+                            {u.displayName.slice(0, 1).toUpperCase()}
+                          </div>
+                        )}
+                        <div className="min-w-0">
+                          <div className="font-bold text-white truncate">
+                            {u.displayName}{' '}
+                            <span className="font-mono font-normal text-white/55">
+                              @{u.username}
+                            </span>
+                          </div>
+                          <div className="text-[11px] text-white/65">
+                            {getRoleLabel(u.role)} · DUPR {u.dupr.toFixed(1)}
+                          </div>
                         </div>
                       </div>
 
@@ -629,7 +894,6 @@ export function ProfileView({
 
           {/* Right Column: Personal Isolated Career Stats + DeepSeek AI Review + History Timeline */}
           <div className="lg:col-span-7 space-y-5">
-            {/* Personal Career Overview + AI Deep Review Trigger */}
             <section className="theme-glass-strong border rounded-3xl p-5 sm:p-6 space-y-4">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div>
@@ -706,7 +970,6 @@ export function ProfileView({
                 </p>
               )}
 
-              {/* DeepSeek Personal Career Review Card */}
               {review && (
                 <div className="rounded-2xl bg-black/40 border border-[var(--theme-accent)]/45 p-4 space-y-3">
                   <div className="flex flex-wrap items-center justify-between gap-2">
@@ -754,7 +1017,9 @@ export function ProfileView({
 
               {personalHistory.records.length === 0 ? (
                 <div className="p-8 text-center space-y-2 text-xs text-white/70">
-                  <p className="text-sm font-bold text-white">暂无与「{currentUser.displayName}」匹配的完赛记录</p>
+                  <p className="text-sm font-bold text-white">
+                    暂无与「{currentUser.displayName}」匹配的完赛记录
+                  </p>
                   <p>
                     当你参与的赛局录入比分后，系统会自动按你的场上昵称归档到这里；你也可以在左侧资料中将昵称改为赛场接龙名。
                   </p>
@@ -789,7 +1054,8 @@ export function ProfileView({
                             {rec.myScore}:{rec.oppScore}
                           </div>
                           <div className="text-[10px] font-mono text-white/60 mt-0.5">
-                            {rec.won ? '胜' : '负'} ({rec.pointDiff > 0 ? `+${rec.pointDiff}` : rec.pointDiff})
+                            {rec.won ? '胜' : '负'} (
+                            {rec.pointDiff > 0 ? `+${rec.pointDiff}` : rec.pointDiff})
                           </div>
                         </div>
                         <button
@@ -805,6 +1071,74 @@ export function ProfileView({
                 </div>
               )}
             </section>
+          </div>
+        </div>
+      )}
+
+      {/* WeChat OAuth Configuration & Instant Album Import Helper Modal */}
+      {wechatGuideOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-end md:items-center justify-center bg-black/75 backdrop-blur-sm p-4"
+          role="dialog"
+          aria-modal="true"
+          onClick={() => setWechatGuideOpen(false)}
+        >
+          <div
+            className="w-full max-w-md theme-glass-strong border rounded-3xl p-5 space-y-4 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-base font-extrabold text-white">
+                <MessageCircle className="w-5 h-5 text-[#07C160]" aria-hidden="true" />
+                <span>微信一键获取头像说明</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setWechatGuideOpen(false)}
+                aria-label="关闭说明弹窗"
+                className="p-1.5 rounded-lg text-white/65 hover:text-white cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-2.5 text-xs text-white/80 leading-relaxed">
+              <p>
+                后端微信 OAuth2 授权接口（<code className="font-mono text-[#8CF0B6]">/api/wechat-auth</code>）已内置完成。按微信官方规则，自动拉取微信头像与昵称需具备<strong>已认证的微信服务号</strong>：
+              </p>
+              <ol className="list-decimal list-inside space-y-1 text-white/75">
+                <li>在 Cloudflare Pages 环境变量中添加 <code className="font-mono text-white">WECHAT_APP_ID</code> 与 <code className="font-mono text-white">WECHAT_APP_SECRET</code>（机密）。</li>
+                <li>在微信公众平台将本站域名填入「网页授权域名」。</li>
+              </ol>
+              {currentUser && (
+                <p className="text-white/90 font-semibold pt-1">
+                  暂未接入服务号？你现在就可以直接从手机相册一键上传自己的微信头像，同样会同步到云端与战报画报中！
+                </p>
+              )}
+            </div>
+
+            <div className="flex gap-2">
+              {currentUser && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setWechatGuideOpen(false);
+                    fileInputRef.current?.click();
+                  }}
+                  className="flex-1 min-h-[42px] rounded-xl theme-accent-bg text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer"
+                >
+                  <Upload className="w-3.5 h-3.5" aria-hidden="true" />
+                  <span>直接从相册上传头像</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setWechatGuideOpen(false)}
+                className="min-h-[42px] px-4 rounded-xl bg-white/10 text-xs font-semibold text-white cursor-pointer"
+              >
+                知道了
+              </button>
+            </div>
           </div>
         </div>
       )}

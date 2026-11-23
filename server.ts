@@ -8,6 +8,12 @@ import {
   parseModelJsonResponse,
   type AnalysisRequestType,
 } from './src/utils/aiAnalysis';
+import {
+  mergeClubSessions,
+  mergeClubUsers,
+  type SessionSyncLike,
+  type UserSyncLike,
+} from './src/utils/clubSyncMerge';
 
 // Load local secrets first (.env.local is gitignored), then fallback to .env
 dotenv.config({ path: '.env.local' });
@@ -188,6 +194,113 @@ async function startServer() {
       updatedAt,
       storageMode: 'local_server',
     });
+  });
+
+  // Local dev mirror of Cloudflare Pages KV /api/club-data (shared users, avatars & calendar sessions)
+  const clubFilePath = path.resolve(__dirname, '.data', 'club-data.json');
+  app.get('/api/club-data', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    try {
+      if (!fs.existsSync(clubFilePath)) {
+        res.json({ ok: true, empty: true, storageMode: 'local_server' });
+        return;
+      }
+      const parsed = JSON.parse(fs.readFileSync(clubFilePath, 'utf-8')) as {
+        users?: UserSyncLike[];
+        sessions?: SessionSyncLike[];
+        updatedAt?: number;
+      };
+      res.json({
+        ok: true,
+        empty: false,
+        users: parsed.users ?? [],
+        sessions: parsed.sessions ?? [],
+        updatedAt: parsed.updatedAt ?? Date.now(),
+        storageMode: 'local_server',
+      });
+    } catch {
+      res.status(500).json({ ok: false, error: '俱乐部数据读取失败' });
+    }
+  });
+
+  app.put('/api/club-data', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    const body = (req.body ?? {}) as { users?: UserSyncLike[]; sessions?: SessionSyncLike[] };
+    if (!Array.isArray(body.users) && !Array.isArray(body.sessions)) {
+      res.status(400).json({ ok: false, error: '无效的俱乐部数据格式' });
+      return;
+    }
+    try {
+      const dir = path.dirname(clubFilePath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const existing = fs.existsSync(clubFilePath)
+        ? (JSON.parse(fs.readFileSync(clubFilePath, 'utf-8')) as {
+            users?: UserSyncLike[];
+            sessions?: SessionSyncLike[];
+          })
+        : {};
+      const updatedAt = Date.now();
+      const nextRecord = {
+        users: Array.isArray(body.users)
+          ? mergeClubUsers(existing.users ?? [], body.users)
+          : existing.users ?? [],
+        sessions: Array.isArray(body.sessions)
+          ? mergeClubSessions(existing.sessions ?? [], body.sessions)
+          : existing.sessions ?? [],
+        updatedAt,
+      };
+      fs.writeFileSync(clubFilePath, JSON.stringify(nextRecord), 'utf-8');
+      res.json({
+        ok: true,
+        updatedAt,
+        users: nextRecord.users,
+        sessions: nextRecord.sessions,
+        storageMode: 'local_server',
+      });
+    } catch {
+      res.status(500).json({ ok: false, error: '俱乐部数据保存失败' });
+    }
+  });
+
+  // Local dev mirror of /api/wechat-auth status check
+  app.get('/api/wechat-auth', (req, res) => {
+    const action = String(req.query.action || 'status');
+    const appId = process.env.WECHAT_APP_ID?.trim();
+    const appSecret = process.env.WECHAT_APP_SECRET?.trim();
+    const configured = Boolean(appId && appSecret);
+    const origin = (process.env.APP_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
+    if (action === 'status') {
+      res.json({
+        ok: true,
+        configured,
+        callbackUrl: `${origin}/api/wechat-auth?action=callback`,
+      });
+      return;
+    }
+    if (!configured) {
+      res.status(503).json({
+        ok: false,
+        configured: false,
+        error: '尚未配置微信服务号 WECHAT_APP_ID 与 WECHAT_APP_SECRET 环境变量',
+      });
+      return;
+    }
+    if (action === 'url') {
+      const callbackUrl = `${origin}/api/wechat-auth?action=callback`;
+      const state = Math.random().toString(36).slice(2, 10);
+      const authorizeUrl =
+        `https://open.weixin.qq.com/connect/oauth2/authorize` +
+        `?appid=${encodeURIComponent(appId!)}` +
+        `&redirect_uri=${encodeURIComponent(callbackUrl)}` +
+        `&response_type=code` +
+        `&scope=snsapi_userinfo` +
+        `&state=${state}#wechat_redirect`;
+      res.json({ ok: true, url: authorizeUrl });
+      return;
+    }
+    res.status(400).json({ ok: false, error: '请在正式 Cloudflare 域名完成微信服务号回调' });
   });
 
   if (process.env.NODE_ENV !== 'production') {

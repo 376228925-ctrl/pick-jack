@@ -239,8 +239,9 @@ export function registerNewAccount(
     return { ok: false, error: `账号「${username}」已被注册` };
   }
 
+  const now = Date.now();
   const newUser: UserAccount = {
-    id: `u-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    id: `u-${now}-${Math.random().toString(36).slice(2, 6)}`,
     username,
     passwordHash: hashPassword(username, input.password),
     role: input.role ?? 'member',
@@ -250,7 +251,8 @@ export function registerNewAccount(
     handedness: 'right',
     playStyle: '均衡全能型',
     bio: '热爱匹克球转转赛',
-    createdAt: Date.now(),
+    createdAt: now,
+    updatedAt: now,
   };
 
   return { ok: true, user: newUser, nextUsers: [...users, newUser] };
@@ -272,9 +274,12 @@ export function updateUserRoleByAdmin(
   if (target.role === 'super_admin') {
     return { ok: false, error: '超级管理员权限不可降级' };
   }
+  const now = Date.now();
   return {
     ok: true,
-    nextUsers: users.map((u) => (u.id === targetUserId ? { ...u, role: nextRole } : u)),
+    nextUsers: users.map((u) =>
+      u.id === targetUserId ? { ...u, role: nextRole, updatedAt: now } : u
+    ),
   };
 }
 

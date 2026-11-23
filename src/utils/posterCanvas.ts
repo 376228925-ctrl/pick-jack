@@ -5,10 +5,16 @@ import type {
   TournamentState,
 } from '../types/tournament';
 import type { PosterCopyResult } from './aiAnalysis';
+import {
+  computeTournamentAwards,
+  getPlayerHonorProfile,
+  type HonorAward,
+} from './awardsEngine';
+import { resolvePlayerAvatar } from './avatarUtils';
 
-export type PosterTheme = 'night_slam' | 'roland_clay' | 'swiss_ticket';
+export type PosterTheme = 'magazine' | 'polaroid' | 'obsidian_gold';
 
-export const NIGHT_HERO_URL = '/src/assets/images/night_court_hero_1795079945626.jpg';
+export const DEFAULT_POSTER_HERO_URL = '/src/assets/images/sunset_coastal_court_1795082351552.jpg';
 
 const FORMAT_LABELS: Record<TournamentFormat, string> = {
   classic: '经典全员转',
@@ -18,7 +24,13 @@ const FORMAT_LABELS: Record<TournamentFormat, string> = {
   ai_smart: 'AI 智适应排阵',
 };
 
-function loadImage(src: string): Promise<HTMLImageElement | null> {
+const SANS = '"PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", -apple-system, sans-serif';
+const SERIF = '"Songti SC", "STSong", "Noto Serif SC", Georgia, serif';
+const CONDENSED = '"DIN Condensed", "Arial Narrow", "PingFang SC", sans-serif';
+const MONO = '"SF Mono", ui-monospace, Menlo, Consolas, monospace';
+
+function loadImage(src?: string): Promise<HTMLImageElement | null> {
+  if (!src) return Promise.resolve(null);
   return new Promise((resolve) => {
     const img = new Image();
     img.crossOrigin = 'anonymous';
@@ -26,6 +38,24 @@ function loadImage(src: string): Promise<HTMLImageElement | null> {
     img.onerror = () => resolve(null);
     img.src = src;
   });
+}
+
+function drawRoundedRectPath(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number
+) {
+  const rad = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rad, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rad);
+  ctx.arcTo(x + w, y + h, x, y + h, rad);
+  ctx.arcTo(x, y + h, x, y, rad);
+  ctx.arcTo(x, y, x + w, y, rad);
+  ctx.closePath();
 }
 
 function drawCoverImage(
@@ -53,6 +83,64 @@ function drawCoverImage(
   ctx.drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh);
 }
 
+function drawCircularAvatar(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement | null,
+  cx: number,
+  cy: number,
+  radius: number,
+  initial: string,
+  bgColor: string,
+  textColor: string,
+  ringColor?: string,
+  ringWidth = 2
+) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+  ctx.closePath();
+  ctx.clip();
+
+  if (img) {
+    drawCoverImage(ctx, img, cx - radius, cy - radius, radius * 2, radius * 2);
+  } else {
+    ctx.fillStyle = bgColor;
+    ctx.fillRect(cx - radius, cy - radius, radius * 2, radius * 2);
+    ctx.fillStyle = textColor;
+    ctx.font = `700 ${Math.round(radius * 0.92)}px ${SANS}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(initial.slice(0, 1).toUpperCase(), cx, cy + 1);
+  }
+  ctx.restore();
+
+  if (ringColor) {
+    ctx.save();
+    ctx.strokeStyle = ringColor;
+    ctx.lineWidth = ringWidth;
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius + ringWidth / 2, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawCrownIcon(ctx: CanvasRenderingContext2D, cx: number, cy: number, color: string) {
+  ctx.save();
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(cx - 14, cy + 8);
+  ctx.lineTo(cx - 16, cy - 6);
+  ctx.lineTo(cx - 6, cy + 1);
+  ctx.lineTo(cx, cy - 10);
+  ctx.lineTo(cx + 6, cy + 1);
+  ctx.lineTo(cx + 16, cy - 6);
+  ctx.lineTo(cx + 14, cy + 8);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
 function drawWrappedText(
   ctx: CanvasRenderingContext2D,
   text: string,
@@ -60,8 +148,10 @@ function drawWrappedText(
   y: number,
   maxWidth: number,
   lineHeight: number,
-  maxLines: number
+  maxLines: number,
+  align: CanvasTextAlign = 'left'
 ): number {
+  ctx.textAlign = align;
   const chars = Array.from(text);
   let line = '';
   let lineCount = 0;
@@ -89,12 +179,14 @@ function drawWrappedText(
   return currentY;
 }
 
-function formatTodayDate(): string {
+function formatTodayDate(sessionDate?: string): string {
+  if (sessionDate && /^\d{4}-\d{2}-\d{2}$/.test(sessionDate)) {
+    return sessionDate.replace(/-/g, '.');
+  }
   const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}.${m}.${day}`;
+  return `${d.getFullYear()}.${String(d.getMonth() + 1).padStart(2, '0')}.${String(
+    d.getDate()
+  ).padStart(2, '0')}`;
 }
 
 export function getDefaultPosterCopy(
@@ -104,35 +196,52 @@ export function getDefaultPosterCopy(
   const mvp = standings[0];
   return {
     coverTitle: state.config.title,
-    coverSub: `${state.config.venue || '夜场灯光硬地'} · ${FORMAT_LABELS[state.config.format]}`,
+    coverSub: `${state.config.venue || '城市匹克球俱乐部'} · ${FORMAT_LABELS[state.config.format]}`,
     mvpQuote:
       mvp && mvp.played > 0
-        ? `${mvp.player.name} 以 ${mvp.wins} 胜与 ${
+        ? `${mvp.player.name} 以 ${mvp.wins} 胜 ${
             mvp.pointDiff >= 0 ? `+${mvp.pointDiff}` : mvp.pointDiff
-          } 净胜分统治中心球场，领衔今夜高燃转转赛。`
-        : '全员轮转搭档，每一拍都在书写夜场硬地的高光时刻。',
+          } 净胜分加冕今日球场焦点，与球友共赴一场酣畅淋漓的旋转对决。`
+        : '阳光、球拍与默契搭档，每一拍都在定格球场高光时刻。',
   };
 }
 
+interface DrawPayload {
+  state: TournamentState;
+  standings: PlayerStanding[];
+  mvp: PlayerStanding | null;
+  completedMatches: number;
+  totalMatches: number;
+  fairness: ScheduleFairnessReport;
+  copy: PosterCopyResult;
+  dateLabel: string;
+  heroImg: HTMLImageElement | null;
+  avatarImgs: Map<string, HTMLImageElement | null>;
+  bestDuo: HonorAward | null;
+}
+
 /**
- * Generates a 2x Retina (880px-wide) art-directed Editorial Sports Magazine Poster PNG.
- * Three curated studio editions:
- * 1. night_slam: Full-bleed floodlit photography + colossal condensed Volt typography + Swiss 2-col ledger
- * 2. roland_clay: Warm cotton fine-art print + burnt terracotta architectural court frame + espresso typography
- * 3. swiss_ticket: Metallic silver Swiss International match ticket stub with royal cobalt MVP block & barcode
+ * Generates a 2x Retina (960x1520) gallery-grade editorial sports poster PNG.
+ * Three curated styles designed for Xiaohongshu & WeChat Moments sharing:
+ * 1. magazine: Warm ivory fine-art editorial magazine cover
+ * 2. polaroid: Archival cream film print with full-bleed photo & frosted glass MVP card
+ * 3. obsidian_gold: Matte obsidian & champagne-gold championship honors edition
  */
 export async function renderPosterToDataUrl(
   state: TournamentState,
   standings: PlayerStanding[],
   fairness: ScheduleFairnessReport,
-  theme: PosterTheme = 'night_slam',
+  theme: PosterTheme = 'magazine',
   aiCopy?: PosterCopyResult | null,
-  heroImageUrl?: string
+  heroImageUrl?: string,
+  avatarsByName?: Record<string, string>
 ): Promise<string> {
   const scale = 2;
-  const width = 440;
-  const height = 740;
+  const width = 480;
+  const height = 760;
   const copy = aiCopy ?? getDefaultPosterCopy(state, standings);
+  const awards = computeTournamentAwards(state, standings);
+  const bestDuo = awards.find((a) => a.id === 'best_duo') ?? null;
 
   const canvas = document.createElement('canvas');
   canvas.width = width * scale;
@@ -142,583 +251,827 @@ export async function renderPosterToDataUrl(
 
   ctx.scale(scale, scale);
 
-  const visibleRows = standings.slice(0, 8);
-  const mvp = standings[0] ?? null;
+  const visibleRows = standings.slice(0, 6);
+  const heroImg = await loadImage(heroImageUrl || DEFAULT_POSTER_HERO_URL);
+
+  const avatarImgs = new Map<string, HTMLImageElement | null>();
+  await Promise.all(
+    visibleRows.map(async (row) => {
+      const src = resolvePlayerAvatar(row.player.name, row.player.avatarUrl, avatarsByName);
+      const loaded = await loadImage(src);
+      avatarImgs.set(row.player.id, loaded);
+    })
+  );
+
   const completedMatches = state.rounds.reduce(
     (sum, r) => sum + r.matches.filter((m) => m.status === 'completed').length,
     0
   );
   const totalMatches = state.rounds.reduce((sum, r) => sum + r.matches.length, 0);
-  const dateLabel = formatTodayDate();
+  const dateLabel = formatTodayDate(state.sessionDate);
 
-  if (theme === 'night_slam') {
-    await drawNightSlamPoster(ctx, width, height, {
-      state,
-      visibleRows,
-      mvp,
-      completedMatches,
-      totalMatches,
-      fairness,
-      copy,
-      dateLabel,
-      heroImageUrl: heroImageUrl || NIGHT_HERO_URL,
-    });
-  } else if (theme === 'roland_clay') {
-    drawRolandClayPoster(ctx, width, height, {
-      state,
-      visibleRows,
-      mvp,
-      completedMatches,
-      totalMatches,
-      fairness,
-      copy,
-      dateLabel,
-    });
+  const payload: DrawPayload = {
+    state,
+    standings: visibleRows,
+    mvp: standings[0] ?? null,
+    completedMatches,
+    totalMatches,
+    fairness,
+    copy,
+    dateLabel,
+    heroImg,
+    avatarImgs,
+    bestDuo,
+  };
+
+  if (theme === 'magazine') {
+    drawMagazinePoster(ctx, width, height, payload);
+  } else if (theme === 'polaroid') {
+    drawPolaroidPoster(ctx, width, height, payload);
   } else {
-    drawSwissTicketPoster(ctx, width, height, {
-      state,
-      visibleRows,
-      mvp,
-      completedMatches,
-      totalMatches,
-      fairness,
-      copy,
-      dateLabel,
-    });
+    drawObsidianGoldPoster(ctx, width, height, payload);
   }
 
   return canvas.toDataURL('image/png');
 }
 
-interface DrawPayload {
-  state: TournamentState;
-  visibleRows: PlayerStanding[];
-  mvp: PlayerStanding | null;
-  completedMatches: number;
-  totalMatches: number;
-  fairness: ScheduleFairnessReport;
-  copy: PosterCopyResult;
-  dateLabel: string;
-  heroImageUrl?: string;
+/**
+ * Generates a 2x Retina (960x1520) Personal Highlight Honor Card PNG for ANY player
+ * with giant circular portrait avatar, metallic crown & medal ring, bespoke honor title,
+ * big stats triad, best partner badge, and scenic full-bleed court photography.
+ */
+export async function renderPersonalSpotlightPosterToDataUrl(
+  state: TournamentState,
+  standing: PlayerStanding,
+  awards: HonorAward[],
+  heroImageUrl?: string,
+  avatarsByName?: Record<string, string>,
+  customQuote?: string
+): Promise<string> {
+  const scale = 2;
+  const w = 480;
+  const h = 760;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = w * scale;
+  canvas.height = h * scale;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return '';
+
+  ctx.scale(scale, scale);
+
+  const profile = getPlayerHonorProfile(standing, awards);
+  const dateLabel = formatTodayDate(state.sessionDate);
+  const heroImg = await loadImage(heroImageUrl || DEFAULT_POSTER_HERO_URL);
+  const avatarSrc = resolvePlayerAvatar(
+    standing.player.name,
+    standing.player.avatarUrl,
+    avatarsByName
+  );
+  const playerAvatarImg = await loadImage(avatarSrc);
+
+  // Best partner lookup from completed matches
+  const partnerScores = new Map<string, { id: string; name: string; wins: number; games: number }>();
+  const playerMap = new Map(state.players.map((p) => [p.id, p]));
+  for (const r of state.rounds) {
+    for (const m of r.matches) {
+      if (m.status !== 'completed' || m.scoreA === null || m.scoreB === null) continue;
+      const inA = m.teamA.includes(standing.player.id);
+      const inB = m.teamB.includes(standing.player.id);
+      if (!inA && !inB) continue;
+      const team = inA ? m.teamA : m.teamB;
+      const won = inA ? m.scoreA > m.scoreB : m.scoreB > m.scoreA;
+      const partnerId = team.find((id) => id !== standing.player.id);
+      if (!partnerId) continue;
+      const prev = partnerScores.get(partnerId) ?? {
+        id: partnerId,
+        name: playerMap.get(partnerId)?.name ?? '球友',
+        wins: 0,
+        games: 0,
+      };
+      prev.games += 1;
+      if (won) prev.wins += 1;
+      partnerScores.set(partnerId, prev);
+    }
+  }
+  const bestPartner = Array.from(partnerScores.values()).sort(
+    (a, b) => b.wins - a.wins || b.games - a.games
+  )[0];
+  const partnerPlayer = bestPartner ? playerMap.get(bestPartner.id) : null;
+  const partnerImg = bestPartner
+    ? await loadImage(
+        resolvePlayerAvatar(bestPartner.name, partnerPlayer?.avatarUrl, avatarsByName)
+      )
+    : null;
+
+  // 1. Full-Bleed Scenic Court Photography Backdrop
+  if (heroImg) {
+    drawCoverImage(ctx, heroImg, 0, 0, w, h);
+  } else {
+    const bg = ctx.createLinearGradient(0, 0, w, h);
+    bg.addColorStop(0, '#1B2D4F');
+    bg.addColorStop(1, '#0C111C');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, w, h);
+  }
+
+  // Deep atmospheric cinema scrim for ultra-crisp editorial legibility
+  const scrim = ctx.createLinearGradient(0, 0, 0, h);
+  scrim.addColorStop(0, 'rgba(11, 15, 24, 0.56)');
+  scrim.addColorStop(0.38, 'rgba(11, 15, 24, 0.62)');
+  scrim.addColorStop(0.72, 'rgba(11, 15, 24, 0.90)');
+  scrim.addColorStop(1, 'rgba(9, 12, 19, 0.97)');
+  ctx.fillStyle = scrim;
+  ctx.fillRect(0, 0, w, h);
+
+  // Subtle champagne gold editorial frame
+  const medalColor =
+    standing.rank === 1
+      ? '#F5C451'
+      : standing.rank === 2
+      ? '#E2E8F0'
+      : standing.rank === 3
+      ? '#E59B6B'
+      : '#F5C451';
+
+  ctx.strokeStyle = 'rgba(245, 196, 81, 0.34)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(18, 18, w - 36, h - 36);
+
+  // 2. Top Masthead
+  ctx.textAlign = 'left';
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.78)';
+  ctx.font = `700 10.5px ${MONO}`;
+  ctx.fillText('PLAYER SPOTLIGHT · 个人高光荣耀卡', 34, 48);
+  ctx.textAlign = 'right';
+  ctx.fillStyle = medalColor;
+  ctx.fillText(dateLabel, w - 34, 48);
+
+  // 3. Crown + Giant Circular Portrait Avatar with Halo Glow
+  const avatarCy = 188;
+  const glow = ctx.createRadialGradient(w / 2, avatarCy, 42, w / 2, avatarCy, 118);
+  glow.addColorStop(0, 'rgba(245, 196, 81, 0.34)');
+  glow.addColorStop(1, 'rgba(245, 196, 81, 0)');
+  ctx.fillStyle = glow;
+  ctx.beginPath();
+  ctx.arc(w / 2, avatarCy, 118, 0, Math.PI * 2);
+  ctx.fill();
+
+  drawCrownIcon(ctx, w / 2, avatarCy - 84, medalColor);
+
+  drawCircularAvatar(
+    ctx,
+    playerAvatarImg,
+    w / 2,
+    avatarCy,
+    62,
+    standing.player.name,
+    '#1F2937',
+    '#FFFFFF',
+    medalColor,
+    4
+  );
+
+  // Rank Medallion Stamp Overlapping Avatar Bottom
+  ctx.fillStyle = medalColor;
+  drawRoundedRectPath(ctx, w / 2 - 44, avatarCy + 48, 88, 24, 12);
+  ctx.fill();
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#0F172A';
+  ctx.font = `800 12px ${MONO}`;
+  ctx.fillText(`NO.${String(standing.rank).padStart(2, '0')} · TOP`, w / 2, avatarCy + 64);
+
+  // 4. Honor Title & Player Name
+  ctx.fillStyle = medalColor;
+  ctx.font = `700 13px ${SANS}`;
+  ctx.fillText(`${profile.primaryBadge} · ${profile.primaryTitle}`, w / 2, 294);
+
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = `800 34px ${SANS}`;
+  ctx.fillText(standing.player.name.slice(0, 12), w / 2, 336);
+
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+  ctx.font = `500 12px ${SANS}`;
+  ctx.fillText(
+    `${state.config.title.slice(0, 16)} · ${FORMAT_LABELS[state.config.format]}`,
+    w / 2,
+    362
+  );
+
+  // 5. Glassmorphic Giant Stats Triad Card
+  const cardX = 34;
+  const cardY = 390;
+  const cardW = w - 68;
+  const cardH = 112;
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
+  drawRoundedRectPath(ctx, cardX, cardY, cardW, cardH, 20);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.16)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  const stats = [
+    {
+      label: '本场战绩',
+      value: `${standing.wins}胜${standing.losses}负`,
+      color: '#FFFFFF',
+    },
+    {
+      label: '本场胜率',
+      value: standing.played > 0 ? `${Math.round(standing.winRate * 100)}%` : '--',
+      color: medalColor,
+    },
+    {
+      label: '净胜分差',
+      value: standing.pointDiff > 0 ? `+${standing.pointDiff}` : `${standing.pointDiff}`,
+      color: standing.pointDiff >= 0 ? '#34E39C' : '#FF8A75',
+    },
+  ];
+
+  const colW = cardW / 3;
+  stats.forEach((st, idx) => {
+    const cx = cardX + colW * idx + colW / 2;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = st.color;
+    ctx.font = `800 30px ${CONDENSED}`;
+    ctx.fillText(st.value, cx, cardY + 58);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.65)';
+    ctx.font = `500 11px ${SANS}`;
+    ctx.fillText(st.label, cx, cardY + 86);
+
+    if (idx < 2) {
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.14)';
+      ctx.beginPath();
+      ctx.moveTo(cardX + colW * (idx + 1), cardY + 24);
+      ctx.lineTo(cardX + colW * (idx + 1), cardY + cardH - 24);
+      ctx.stroke();
+    }
+  });
+
+  // 6. Best Partner Synergy Strip (if available)
+  let quoteTop = 536;
+  if (bestPartner) {
+    const duoY = 520;
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.06)';
+    drawRoundedRectPath(ctx, 34, duoY, w - 68, 56, 16);
+    ctx.fill();
+    drawCircularAvatar(
+      ctx,
+      partnerImg,
+      66,
+      duoY + 28,
+      18,
+      bestPartner.name,
+      '#334155',
+      '#FFFFFF',
+      '#7CC2FF',
+      1.8
+    );
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#7CC2FF';
+    ctx.font = `700 10.5px ${SANS}`;
+    ctx.fillText('本场默契拍档', 96, duoY + 23);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = `700 14px ${SANS}`;
+    ctx.fillText(bestPartner.name.slice(0, 10), 96, duoY + 43);
+
+    ctx.textAlign = 'right';
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.78)';
+    ctx.font = `600 11.5px ${MONO}`;
+    ctx.fillText(`搭档 ${bestPartner.wins}胜/${bestPartner.games}场`, w - 48, duoY + 33);
+    quoteTop = 608;
+  }
+
+  // 7. Celebratory Editorial Quote
+  const quoteText = customQuote || profile.slogan;
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.88)';
+  ctx.font = `500 13.5px ${SERIF}`;
+  drawWrappedText(ctx, `“${quoteText}”`, w / 2, quoteTop, w - 84, 22, 3, 'center');
+
+  // 8. Club Colophon Footer
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.14)';
+  ctx.beginPath();
+  ctx.moveTo(34, h - 56);
+  ctx.lineTo(w - 34, h - 56);
+  ctx.stroke();
+
+  ctx.textAlign = 'left';
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.65)';
+  ctx.font = `500 11px ${SANS}`;
+  ctx.fillText(state.config.venue || '轻转匹克球俱乐部', 34, h - 32);
+
+  ctx.textAlign = 'right';
+  ctx.fillStyle = medalColor;
+  ctx.font = `700 11px ${MONO}`;
+  ctx.fillText('轻转匹克 · QINGZHUAN', w - 34, h - 32);
+
+  return canvas.toDataURL('image/png');
 }
 
-async function drawNightSlamPoster(
+function drawMagazinePoster(
   ctx: CanvasRenderingContext2D,
   w: number,
   h: number,
   data: DrawPayload
 ) {
-  const { visibleRows, mvp, completedMatches, totalMatches, fairness, copy, dateLabel, state, heroImageUrl } = data;
+  const { standings, mvp, completedMatches, totalMatches, copy, dateLabel, heroImg, avatarImgs, state } = data;
 
-  // 1. Obsidian editorial canvas
-  ctx.fillStyle = '#070A10';
+  // 1. Warm Ivory Gallery Paper
+  ctx.fillStyle = '#F7F3EC';
   ctx.fillRect(0, 0, w, h);
 
-  // 2. Full-bleed scenic court photography (top 315px)
-  const photoH = 315;
-  const heroImg = await loadImage(heroImageUrl || NIGHT_HERO_URL);
-  if (heroImg) {
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(0, 0, w, photoH);
-    ctx.clip();
-    drawCoverImage(ctx, heroImg, 0, 0, w, photoH);
-    ctx.restore();
-  } else {
-    const fallbackGrad = ctx.createLinearGradient(0, 0, w, photoH);
-    fallbackGrad.addColorStop(0, '#0E2E7A');
-    fallbackGrad.addColorStop(1, '#070A10');
-    ctx.fillStyle = fallbackGrad;
-    ctx.fillRect(0, 0, w, photoH);
-  }
-
-  // Deep dramatic gradient scrim into obsidian canvas
-  const scrim = ctx.createLinearGradient(0, 0, 0, photoH);
-  scrim.addColorStop(0, 'rgba(7, 10, 16, 0.45)');
-  scrim.addColorStop(0.5, 'rgba(7, 10, 16, 0.38)');
-  scrim.addColorStop(0.86, 'rgba(7, 10, 16, 0.92)');
-  scrim.addColorStop(1, '#070A10');
-  ctx.fillStyle = scrim;
-  ctx.fillRect(0, 0, w, photoH + 2);
-
-  // Top Volt Signature Bar
-  ctx.fillStyle = '#D4FF2B';
-  ctx.fillRect(28, 22, 42, 4);
-
-  // Magazine Masthead
-  ctx.fillStyle = '#D4FF2B';
-  ctx.font = '700 11px "JetBrains Mono", "Noto Sans SC", monospace';
-  ctx.fillText('NIGHT COURT EDITION // 轻转匹克', 28, 44);
-  ctx.textAlign = 'right';
-  ctx.fillStyle = 'rgba(255,255,255,0.82)';
-  ctx.fillText(`${dateLabel} · ${completedMatches}/${totalMatches} MATCHES`, w - 28, 44);
+  // Subtle top editorial masthead
+  ctx.fillStyle = '#18181B';
+  ctx.font = `700 11px ${MONO}`;
   ctx.textAlign = 'left';
+  ctx.fillText('THE PICKLEBALL JOURNAL', 28, 34);
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#78716C';
+  ctx.fillText(`ISSUE ${dateLabel}`, w - 28, 34);
 
-  // Colossal Watermark "01" overlapping horizon
-  if (mvp) {
-    ctx.fillStyle = 'rgba(212, 255, 43, 0.14)';
-    ctx.font = 'italic 800 132px "Barlow Condensed", sans-serif';
-    ctx.textAlign = 'right';
-    ctx.fillText(
-      mvp.pointDiff >= 0 ? `+${mvp.pointDiff}` : `${mvp.pointDiff}`,
-      w - 18,
-      268
-    );
-    ctx.textAlign = 'left';
-  }
-
-  // Main Magazine Cover Title
-  ctx.fillStyle = '#FFFFFF';
-  ctx.font = '800 28px "Outfit", "Noto Sans SC", sans-serif';
-  drawWrappedText(ctx, copy.coverTitle, 28, 178, w - 56, 35, 2);
-
-  ctx.fillStyle = '#C6D2E6';
-  ctx.font = '500 12.5px "Noto Sans SC", sans-serif';
-  ctx.fillText(copy.coverSub.slice(0, 32), 28, 236);
-
-  // Horizontal Hairline Rule
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.18)';
+  // Thin editorial rule
+  ctx.strokeStyle = 'rgba(24, 24, 27, 0.14)';
   ctx.lineWidth = 1;
   ctx.beginPath();
-  ctx.moveTo(28, 260);
-  ctx.lineTo(w - 28, 260);
+  ctx.moveTo(28, 46);
+  ctx.lineTo(w - 28, 46);
   ctx.stroke();
 
-  // Sculptural MVP Hero Block (Asymmetric split)
-  if (mvp && mvp.played > 0) {
-    ctx.fillStyle = '#D4FF2B';
-    ctx.font = '700 11px "JetBrains Mono", "Noto Sans SC", monospace';
-    ctx.fillText('CHAMPION / NIGHT MVP', 28, 286);
+  // 2. Crisp Rounded Full-Width Scenic Court Photography (300px tall)
+  const photoX = 28;
+  const photoY = 60;
+  const photoW = w - 56;
+  const photoH = 296;
 
-    ctx.fillStyle = '#FFFFFF';
-    ctx.font = '800 34px "Outfit", "Noto Sans SC", sans-serif';
-    ctx.fillText(mvp.player.name, 28, 326);
+  ctx.save();
+  drawRoundedRectPath(ctx, photoX, photoY, photoW, photoH, 20);
+  ctx.clip();
+  if (heroImg) {
+    drawCoverImage(ctx, heroImg, photoX, photoY, photoW, photoH);
+  } else {
+    const g = ctx.createLinearGradient(photoX, photoY, photoX + photoW, photoY + photoH);
+    g.addColorStop(0, '#E89578');
+    g.addColorStop(1, '#2D527C');
+    ctx.fillStyle = g;
+    ctx.fillRect(photoX, photoY, photoW, photoH);
+  }
+  // Soft cinematic bottom scrim inside photo only
+  const scrim = ctx.createLinearGradient(0, photoY + 120, 0, photoY + photoH);
+  scrim.addColorStop(0, 'rgba(15, 20, 28, 0)');
+  scrim.addColorStop(1, 'rgba(15, 20, 28, 0.72)');
+  ctx.fillStyle = scrim;
+  ctx.fillRect(photoX, photoY, photoW, photoH);
 
-    ctx.fillStyle = '#9AA5BC';
-    ctx.font = '600 12px "JetBrains Mono", "Noto Sans SC", monospace';
-    const partnerSuffix = mvp.bestPartner ? ` · 最佳拍档 ${mvp.bestPartner.partnerName}` : '';
-    ctx.fillText(
-      `${mvp.wins}W-${mvp.losses}L · 胜率 ${Math.round(mvp.winRate * 100)}%${partnerSuffix}`,
-      28,
-      350
+  // Translucent magazine title inside photo
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.22)';
+  ctx.font = `800 44px ${CONDENSED}`;
+  ctx.textAlign = 'left';
+  ctx.fillText('CLUB EDITION', photoX + 20, photoY + 52);
+
+  // Clean headline anchored cleanly to bottom-left of photo
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = `700 24px ${SANS}`;
+  drawWrappedText(ctx, copy.coverTitle, photoX + 22, photoY + photoH - 48, photoW - 44, 30, 2);
+
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
+  ctx.font = `500 11.5px ${SANS}`;
+  ctx.textAlign = 'left';
+  ctx.fillText(copy.coverSub.slice(0, 32), photoX + 22, photoY + photoH - 18);
+  ctx.restore();
+
+  // 3. Elevated MVP Feature Strip (Clean White Card with Circular Avatar)
+  const mvpY = 374;
+  ctx.save();
+  ctx.shadowColor = 'rgba(24, 24, 27, 0.06)';
+  ctx.shadowBlur = 18;
+  ctx.shadowOffsetY = 6;
+  ctx.fillStyle = '#FFFFFF';
+  drawRoundedRectPath(ctx, 28, mvpY, w - 56, 92, 18);
+  ctx.fill();
+  ctx.restore();
+
+  if (mvp) {
+    drawCircularAvatar(
+      ctx,
+      avatarImgs.get(mvp.player.id) ?? null,
+      68,
+      mvpY + 46,
+      26,
+      mvp.player.name,
+      '#1F2937',
+      '#FFFFFF',
+      '#D97757',
+      2.5
     );
 
-    // Colossal Optic Volt Stat on Right
-    ctx.textAlign = 'right';
-    ctx.fillStyle = '#D4FF2B';
-    ctx.font = 'italic 800 58px "Barlow Condensed", sans-serif';
-    ctx.fillText(mvp.pointDiff >= 0 ? `+${mvp.pointDiff}` : `${mvp.pointDiff}`, w - 28, 336);
-    ctx.fillStyle = '#8E9AB2';
-    ctx.font = '600 10.5px "Noto Sans SC", sans-serif';
-    ctx.fillText('NET DIFF · 净胜分', w - 28, 353);
     ctx.textAlign = 'left';
-  }
+    ctx.fillStyle = '#D97757';
+    ctx.font = `700 10px ${MONO}`;
+    ctx.fillText('CHAMPION · 本场焦点球手', 108, mvpY + 28);
 
-  // Editorial AI Pull-Quote Strip
-  ctx.fillStyle = '#D4FF2B';
-  ctx.fillRect(28, 374, 3, 42);
-  ctx.fillStyle = '#D8E1F0';
-  ctx.font = '500 12.5px "Noto Sans SC", sans-serif';
-  drawWrappedText(ctx, `“${copy.mvpQuote}”`, 42, 390, w - 72, 19, 2);
+    ctx.fillStyle = '#18181B';
+    ctx.font = `800 22px ${SANS}`;
+    ctx.fillText(mvp.player.name.slice(0, 10), 108, mvpY + 56);
 
-  // 2-Column Swiss Typographic Roster Ledger (NO Spreadsheet Boxes!)
-  const ledgerTop = 442;
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.14)';
-  ctx.beginPath();
-  ctx.moveTo(28, ledgerTop);
-  ctx.lineTo(w - 28, ledgerTop);
-  ctx.stroke();
-
-  ctx.fillStyle = '#8E9AB2';
-  ctx.font = '700 10.5px "JetBrains Mono", "Noto Sans SC", monospace';
-  ctx.fillText('OFFICIAL STANDINGS // 战绩总榜', 28, ledgerTop + 20);
-  ctx.textAlign = 'right';
-  ctx.fillText(`${state.config.targetScore} PTS · ${FORMAT_LABELS[state.config.format]}`, w - 28, ledgerTop + 20);
-  ctx.textAlign = 'left';
-
-  const colW = (w - 56 - 20) / 2;
-  const rowH = 52;
-  visibleRows.forEach((row, idx) => {
-    const col = idx < 4 ? 0 : 1;
-    const r = idx % 4;
-    const x = 28 + col * (colW + 20);
-    const y = ledgerTop + 34 + r * rowH;
-
-    // Hairline bottom divider
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
-    ctx.beginPath();
-    ctx.moveTo(x, y + rowH - 4);
-    ctx.lineTo(x + colW, y + rowH - 4);
-    ctx.stroke();
-
-    // Oversized italic index
-    ctx.fillStyle = row.rank === 1 ? '#D4FF2B' : row.rank <= 3 ? '#7BB1FF' : '#58647A';
-    ctx.font = 'italic 800 22px "Barlow Condensed", sans-serif';
-    ctx.fillText(String(row.rank).padStart(2, '0'), x, y + 26);
-
-    // Name + record
-    ctx.fillStyle = '#F4F7FB';
-    ctx.font = '700 14px "Noto Sans SC", sans-serif';
-    ctx.fillText(row.player.name.slice(0, 6), x + 30, y + 21);
-
-    ctx.fillStyle = '#8E9AB2';
-    ctx.font = '500 11px "JetBrains Mono", monospace';
-    ctx.fillText(`${row.wins}W-${row.losses}L · ${row.player.rating.toFixed(1)}`, x + 30, y + 38);
-
-    // Right point diff
-    ctx.textAlign = 'right';
-    ctx.fillStyle = row.pointDiff > 0 ? '#22D38B' : row.pointDiff < 0 ? '#FF6448' : '#8E9AB2';
-    ctx.font = 'italic 800 20px "Barlow Condensed", monospace';
-    ctx.fillText(row.pointDiff > 0 ? `+${row.pointDiff}` : `${row.pointDiff}`, x + colW, y + 28);
-    ctx.textAlign = 'left';
-  });
-
-  // Footer Colophon
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.14)';
-  ctx.beginPath();
-  ctx.moveTo(28, h - 54);
-  ctx.lineTo(w - 28, h - 54);
-  ctx.stroke();
-
-  ctx.fillStyle = '#8E9AB2';
-  ctx.font = '600 10.5px "JetBrains Mono", "Noto Sans SC", monospace';
-  ctx.fillText(`搭档不重复 ${fairness.partnerUniquenessPct}%  ·  公平度 ${fairness.compositeScore}`, 28, h - 28);
-  ctx.textAlign = 'right';
-  ctx.fillStyle = '#D4FF2B';
-  ctx.fillText('PICKLEFLOW // 轻转匹克', w - 28, h - 28);
-  ctx.textAlign = 'left';
-}
-
-function drawRolandClayPoster(
-  ctx: CanvasRenderingContext2D,
-  w: number,
-  h: number,
-  data: DrawPayload
-) {
-  const { visibleRows, mvp, completedMatches, totalMatches, fairness, copy, dateLabel, state } = data;
-
-  // Fine-Art Warm Cotton Paper
-  ctx.fillStyle = '#F4EDE2';
-  ctx.fillRect(0, 0, w, h);
-
-  // Double Swiss Fine-Art Frame
-  ctx.strokeStyle = '#181411';
-  ctx.lineWidth = 1.5;
-  ctx.strokeRect(18, 18, w - 36, h - 36);
-  ctx.strokeStyle = 'rgba(24, 20, 17, 0.25)';
-  ctx.lineWidth = 0.75;
-  ctx.strokeRect(23, 23, w - 46, h - 46);
-
-  // Masthead
-  ctx.fillStyle = '#C94A29';
-  ctx.font = '700 11px "JetBrains Mono", "Noto Sans SC", monospace';
-  ctx.fillText('EDITION TERRE BATTUE // 轻转匹克画报', 36, 48);
-  ctx.textAlign = 'right';
-  ctx.fillStyle = '#574E46';
-  ctx.fillText(dateLabel, w - 36, 48);
-  ctx.textAlign = 'left';
-
-  // Bold Editorial Title
-  ctx.fillStyle = '#181411';
-  ctx.font = '800 28px "Outfit", "Noto Sans SC", sans-serif';
-  drawWrappedText(ctx, copy.coverTitle, 36, 88, w - 72, 34, 2);
-
-  ctx.fillStyle = '#6B5E53';
-  ctx.font = '500 12px "Noto Sans SC", sans-serif';
-  ctx.fillText(copy.coverSub.slice(0, 34), 36, 138);
-
-  // Architectural Clay Court Graphic Block (Terracotta + Chalk Lines)
-  const courtX = 36;
-  const courtY = 156;
-  const courtW = w - 72;
-  const courtH = 178;
-
-  ctx.fillStyle = '#C94A29';
-  ctx.fillRect(courtX, courtY, courtW, courtH);
-
-  // Crisp Architectural Chalk Geometry inside Clay Court
-  ctx.strokeStyle = 'rgba(244, 237, 226, 0.52)';
-  ctx.lineWidth = 1.5;
-  ctx.strokeRect(courtX + 16, courtY + 14, courtW - 32, courtH - 28);
-  ctx.beginPath();
-  ctx.moveTo(courtX + courtW * 0.5, courtY + 14);
-  ctx.lineTo(courtX + courtW * 0.5, courtY + courtH - 14);
-  ctx.moveTo(courtX + courtW * 0.34, courtY + 14);
-  ctx.lineTo(courtX + courtW * 0.34, courtY + courtH - 14);
-  ctx.moveTo(courtX + courtW * 0.66, courtY + 14);
-  ctx.lineTo(courtX + courtW * 0.66, courtY + courtH - 14);
-  ctx.stroke();
-
-  // MVP Sculptural Overlay inside Terracotta Court
-  if (mvp && mvp.played > 0) {
-    ctx.fillStyle = 'rgba(244, 237, 226, 0.88)';
-    ctx.font = '700 11px "JetBrains Mono", "Noto Sans SC", monospace';
-    ctx.fillText('NO.01 CHAMPION · 本场 MVP', courtX + 26, courtY + 42);
-
-    ctx.fillStyle = '#FFFFFF';
-    ctx.font = '800 38px "Outfit", "Noto Sans SC", sans-serif';
-    ctx.fillText(mvp.player.name, courtX + 26, courtY + 94);
-
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
-    ctx.font = '600 12px "JetBrains Mono", "Noto Sans SC", monospace';
+    ctx.fillStyle = '#78716C';
+    ctx.font = `500 11.5px ${SANS}`;
     ctx.fillText(
       `${mvp.wins}胜 ${mvp.losses}负 · 胜率 ${Math.round(mvp.winRate * 100)}%`,
-      courtX + 26,
-      courtY + 124
+      108,
+      mvpY + 76
     );
-
-    if (mvp.bestPartner) {
-      ctx.fillText(`最佳搭档 · ${mvp.bestPartner.partnerName}`, courtX + 26, courtY + 146);
-    }
 
     ctx.textAlign = 'right';
-    ctx.fillStyle = '#F4EDE2';
-    ctx.font = 'italic 800 72px "Barlow Condensed", sans-serif';
-    ctx.fillText(
-      mvp.pointDiff >= 0 ? `+${mvp.pointDiff}` : `${mvp.pointDiff}`,
-      courtX + courtW - 24,
-      courtY + 114
-    );
-    ctx.font = '600 11px "Noto Sans SC", sans-serif';
-    ctx.fillText('净胜分差', courtX + courtW - 24, courtY + 142);
-    ctx.textAlign = 'left';
+    ctx.fillStyle = '#18181B';
+    ctx.font = `700 40px ${CONDENSED}`;
+    ctx.fillText(mvp.pointDiff >= 0 ? `+${mvp.pointDiff}` : `${mvp.pointDiff}`, w - 46, mvpY + 54);
+    ctx.fillStyle = '#78716C';
+    ctx.font = `500 10px ${SANS}`;
+    ctx.fillText('净胜分差', w - 46, mvpY + 73);
   }
 
-  // Editorial Quote on Paper
-  ctx.fillStyle = '#181411';
-  ctx.font = '600 13px "Noto Sans SC", sans-serif';
-  drawWrappedText(ctx, `“${copy.mvpQuote}”`, 36, 366, w - 72, 20, 2);
+  // 4. Refined Pull-Quote on Paper
+  ctx.fillStyle = '#57534E';
+  ctx.font = `500 12.5px ${SERIF}`;
+  drawWrappedText(ctx, `“${copy.mvpQuote}”`, 32, 494, w - 64, 20, 2, 'left');
 
-  // Fine-art Hairline Rule
-  ctx.strokeStyle = '#181411';
-  ctx.lineWidth = 1.2;
+  // 5. Airy Top-6 Leaderboard (Generous spacing, mini circular avatars)
+  const listTop = 542;
+  ctx.strokeStyle = 'rgba(24, 24, 27, 0.12)';
   ctx.beginPath();
-  ctx.moveTo(36, 412);
-  ctx.lineTo(w - 36, 412);
+  ctx.moveTo(28, listTop - 10);
+  ctx.lineTo(w - 28, listTop - 10);
   ctx.stroke();
 
-  ctx.fillStyle = '#6B5E53';
-  ctx.font = '700 10.5px "JetBrains Mono", "Noto Sans SC", monospace';
-  ctx.fillText('CLASSEMENT // 完整排名', 36, 434);
-  ctx.textAlign = 'right';
-  ctx.fillText(`${completedMatches}/${totalMatches} MATCHES · ${state.config.targetScore}分制`, w - 36, 434);
   ctx.textAlign = 'left';
+  ctx.fillStyle = '#78716C';
+  ctx.font = `600 10px ${MONO}`;
+  ctx.fillText('HONOR ROLL · 积分荣誉榜', 28, listTop + 6);
+  ctx.textAlign = 'right';
+  ctx.fillText(`${completedMatches}/${totalMatches} MATCHES · ${state.config.targetScore}分制`, w - 28, listTop + 6);
 
-  // 2-Column Editorial List
-  const colW = (w - 72 - 22) / 2;
-  const rowH = 52;
-  visibleRows.forEach((row, idx) => {
-    const col = idx < 4 ? 0 : 1;
-    const r = idx % 4;
-    const x = 36 + col * (colW + 22);
-    const y = 448 + r * rowH;
+  const colW = (w - 56 - 24) / 2;
+  const rows = standings.slice(0, 6);
+  rows.forEach((row, idx) => {
+    const col = idx < 3 ? 0 : 1;
+    const r = idx % 3;
+    const x = 28 + col * (colW + 24);
+    const y = listTop + 26 + r * 48;
 
-    ctx.strokeStyle = 'rgba(24, 20, 17, 0.14)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(x, y + rowH - 4);
-    ctx.lineTo(x + colW, y + rowH - 4);
-    ctx.stroke();
+    drawCircularAvatar(
+      ctx,
+      avatarImgs.get(row.player.id) ?? null,
+      x + 15,
+      y + 18,
+      14,
+      row.player.name,
+      row.rank === 1 ? '#D97757' : '#27272A',
+      '#FFFFFF'
+    );
 
-    ctx.fillStyle = row.rank === 1 ? '#C94A29' : '#181411';
-    ctx.font = 'italic 800 22px "Barlow Condensed", sans-serif';
-    ctx.fillText(String(row.rank).padStart(2, '0'), x, y + 26);
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#18181B';
+    ctx.font = `700 13.5px ${SANS}`;
+    ctx.fillText(`${row.rank}. ${row.player.name.slice(0, 5)}`, x + 36, y + 16);
 
-    ctx.fillStyle = '#181411';
-    ctx.font = '700 14px "Noto Sans SC", sans-serif';
-    ctx.fillText(row.player.name.slice(0, 6), x + 28, y + 21);
-
-    ctx.fillStyle = '#6B5E53';
-    ctx.font = '500 11px "JetBrains Mono", monospace';
-    ctx.fillText(`${row.wins}W-${row.losses}L · ${row.player.rating.toFixed(1)}`, x + 28, y + 38);
+    ctx.fillStyle = '#78716C';
+    ctx.font = `500 10.5px ${MONO}`;
+    ctx.fillText(`${row.wins}W-${row.losses}L · ${row.player.rating.toFixed(1)}`, x + 36, y + 32);
 
     ctx.textAlign = 'right';
-    ctx.fillStyle = row.pointDiff > 0 ? '#1A7A52' : row.pointDiff < 0 ? '#C94A29' : '#6B5E53';
-    ctx.font = 'italic 800 20px "Barlow Condensed", monospace';
-    ctx.fillText(row.pointDiff > 0 ? `+${row.pointDiff}` : `${row.pointDiff}`, x + colW, y + 28);
-    ctx.textAlign = 'left';
+    ctx.fillStyle = row.pointDiff > 0 ? '#15803D' : row.pointDiff < 0 ? '#C2410C' : '#78716C';
+    ctx.font = `700 18px ${CONDENSED}`;
+    ctx.fillText(row.pointDiff > 0 ? `+${row.pointDiff}` : `${row.pointDiff}`, x + colW, y + 24);
+
+    if (r < 2) {
+      ctx.strokeStyle = 'rgba(24, 24, 27, 0.08)';
+      ctx.beginPath();
+      ctx.moveTo(x, y + 43);
+      ctx.lineTo(x + colW, y + 43);
+      ctx.stroke();
+    }
   });
 
-  // Fine-Art Colophon Footer
-  ctx.fillStyle = '#6B5E53';
-  ctx.font = '600 10.5px "JetBrains Mono", "Noto Sans SC", monospace';
-  ctx.fillText(`不重复搭档 ${fairness.partnerUniquenessPct}% · 公平 ${fairness.compositeScore}`, 36, h - 38);
-  ctx.textAlign = 'right';
-  ctx.fillStyle = '#C94A29';
-  ctx.fillText('LE JOURNAL DU PICKLEBALL', w - 36, h - 38);
+  // 6. Minimal Editorial Colophon Footer
+  ctx.strokeStyle = 'rgba(24, 24, 27, 0.12)';
+  ctx.beginPath();
+  ctx.moveTo(28, h - 46);
+  ctx.lineTo(w - 28, h - 46);
+  ctx.stroke();
+
   ctx.textAlign = 'left';
+  ctx.fillStyle = '#78716C';
+  ctx.font = `500 10.5px ${SANS}`;
+  ctx.fillText(state.config.venue || '轻转匹克球俱乐部', 28, h - 22);
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#18181B';
+  ctx.font = `700 10.5px ${MONO}`;
+  ctx.fillText('QINGZHUAN PICKLEBALL', w - 28, h - 22);
 }
 
-function drawSwissTicketPoster(
+function drawPolaroidPoster(
   ctx: CanvasRenderingContext2D,
   w: number,
   h: number,
   data: DrawPayload
 ) {
-  const { visibleRows, mvp, completedMatches, totalMatches, fairness, copy, dateLabel, state } = data;
+  const { standings, mvp, copy, dateLabel, heroImg, avatarImgs, state } = data;
 
-  // Metallic Silver-White Swiss Paper
-  ctx.fillStyle = '#ECEFF4';
+  // 1. Soft Gallery Cream Backdrop
+  ctx.fillStyle = '#FAF7F1';
   ctx.fillRect(0, 0, w, h);
 
-  // Jet Black Outer Grid Header Strip
-  ctx.fillStyle = '#0A0D12';
-  ctx.fillRect(0, 0, w, 58);
+  // Subtle archival frame border
+  ctx.strokeStyle = 'rgba(28, 25, 23, 0.08)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(14, 14, w - 28, h - 28);
 
-  ctx.fillStyle = '#D4FF2B';
-  ctx.font = '700 11px "JetBrains Mono", monospace';
-  ctx.fillText('MATCH PASS // OFFICIAL RESULT TICKET', 24, 34);
-  ctx.textAlign = 'right';
-  ctx.fillStyle = '#FFFFFF';
-  ctx.fillText(`NO.${dateLabel.replace(/\./g, '')}`, w - 24, 34);
-  ctx.textAlign = 'left';
+  // 2. Expansive Polaroid Photo Window (Top 430px)
+  const px = 26;
+  const py = 26;
+  const pw = w - 52;
+  const ph = 420;
 
-  // Royal Cobalt Asymmetric Hero Block
-  const heroY = 76;
-  const heroH = 196;
-  ctx.fillStyle = '#133EE6';
-  ctx.fillRect(24, heroY, w - 48, heroH);
-
-  ctx.fillStyle = 'rgba(255,255,255,0.75)';
-  ctx.font = '600 11px "JetBrains Mono", "Noto Sans SC", monospace';
-  ctx.fillText(`${FORMAT_LABELS[state.config.format]} · ${state.config.targetScore}分制`, 42, heroY + 30);
-
-  ctx.fillStyle = '#FFFFFF';
-  ctx.font = '800 26px "Outfit", "Noto Sans SC", sans-serif';
-  drawWrappedText(ctx, copy.coverTitle, 42, heroY + 64, w - 84, 32, 2);
-
-  if (mvp && mvp.played > 0) {
-    ctx.strokeStyle = 'rgba(255,255,255,0.28)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(42, heroY + 114);
-    ctx.lineTo(w - 42, heroY + 114);
-    ctx.stroke();
-
-    ctx.fillStyle = '#D4FF2B';
-    ctx.font = '700 11px "JetBrains Mono", "Noto Sans SC", monospace';
-    ctx.fillText('MVP LEADER', 42, heroY + 136);
-
-    ctx.fillStyle = '#FFFFFF';
-    ctx.font = '800 30px "Noto Sans SC", sans-serif';
-    ctx.fillText(mvp.player.name, 42, heroY + 172);
-
-    ctx.textAlign = 'right';
-    ctx.fillStyle = '#D4FF2B';
-    ctx.font = 'italic 800 54px "Barlow Condensed", sans-serif';
-    ctx.fillText(
-      mvp.pointDiff >= 0 ? `+${mvp.pointDiff}` : `${mvp.pointDiff}`,
-      w - 42,
-      heroY + 176
-    );
-    ctx.textAlign = 'left';
+  ctx.save();
+  drawRoundedRectPath(ctx, px, py, pw, ph, 14);
+  ctx.clip();
+  if (heroImg) {
+    drawCoverImage(ctx, heroImg, px, py, pw, ph);
+  } else {
+    ctx.fillStyle = '#2A4365';
+    ctx.fillRect(px, py, pw, ph);
   }
 
-  // Ticket Perforation Cutout Notches + Dashed Tear Line
-  const tearY = 294;
-  ctx.strokeStyle = '#0A0D12';
-  ctx.lineWidth = 1.5;
-  ctx.setLineDash([5, 5]);
-  ctx.beginPath();
-  ctx.moveTo(24, tearY);
-  ctx.lineTo(w - 24, tearY);
-  ctx.stroke();
-  ctx.setLineDash([]);
+  // Soft warm film vignette
+  const grad = ctx.createLinearGradient(0, py, 0, py + ph);
+  grad.addColorStop(0, 'rgba(12, 16, 24, 0.25)');
+  grad.addColorStop(0.55, 'rgba(12, 16, 24, 0.05)');
+  grad.addColorStop(1, 'rgba(12, 16, 24, 0.65)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(px, py, pw, ph);
 
-  ctx.fillStyle = '#0A0D12';
-  ctx.beginPath();
-  ctx.arc(0, tearY, 12, -Math.PI / 2, Math.PI / 2);
-  ctx.fill();
-  ctx.beginPath();
-  ctx.arc(w, tearY, 12, Math.PI / 2, (Math.PI * 3) / 2);
-  ctx.fill();
+  // Top Film Camera Date Stamp
+  ctx.textAlign = 'left';
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.92)';
+  ctx.font = `600 11px ${MONO}`;
+  ctx.fillText('MATCH DAY MEMORY', px + 20, py + 30);
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#FCD34D';
+  ctx.fillText(dateLabel, px + pw - 20, py + 30);
 
-  // Pull Quote Box
-  ctx.fillStyle = '#0A0D12';
-  ctx.font = '600 12.5px "Noto Sans SC", sans-serif';
-  drawWrappedText(ctx, `“${copy.mvpQuote}”`, 24, 326, w - 48, 19, 2);
+  // Frosted Glass MVP Spotlight Card nestled inside bottom of photo
+  if (mvp) {
+    const cardX = px + 18;
+    const cardY = py + ph - 102;
+    const cardW = pw - 36;
+    const cardH = 82;
 
-  // Strict Swiss Grid Metadata Cells
-  const metaY = 368;
-  ctx.strokeStyle = '#0A0D12';
-  ctx.lineWidth = 1.2;
-  ctx.strokeRect(24, metaY, w - 48, 46);
-  ctx.beginPath();
-  ctx.moveTo(24 + (w - 48) / 3, metaY);
-  ctx.lineTo(24 + (w - 48) / 3, metaY + 46);
-  ctx.moveTo(24 + ((w - 48) * 2) / 3, metaY);
-  ctx.lineTo(24 + ((w - 48) * 2) / 3, metaY + 46);
-  ctx.stroke();
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.88)';
+    drawRoundedRectPath(ctx, cardX, cardY, cardW, cardH, 16);
+    ctx.fill();
 
-  const cells = [
-    { label: 'MATCHES', val: `${completedMatches}/${totalMatches}` },
-    { label: 'UNIQUE PAIR', val: `${fairness.partnerUniquenessPct}%` },
-    { label: 'FAIRNESS', val: `${fairness.compositeScore} PTS` },
-  ];
-  cells.forEach((cell, i) => {
-    const cx = 34 + i * ((w - 48) / 3);
-    ctx.fillStyle = '#536073';
-    ctx.font = '700 9.5px "JetBrains Mono", monospace';
-    ctx.fillText(cell.label, cx, metaY + 17);
-    ctx.fillStyle = '#0A0D12';
-    ctx.font = 'italic 800 18px "Barlow Condensed", monospace';
-    ctx.fillText(cell.val, cx, metaY + 38);
-  });
+    drawCircularAvatar(
+      ctx,
+      avatarImgs.get(mvp.player.id) ?? null,
+      cardX + 38,
+      cardY + 41,
+      24,
+      mvp.player.name,
+      '#1C1917',
+      '#FFFFFF',
+      '#FFFFFF',
+      2
+    );
 
-  // 2-Column Clean Black-Ink Swiss Roster
-  const colW = (w - 48 - 20) / 2;
-  const rowH = 50;
-  visibleRows.forEach((row, idx) => {
-    const col = idx < 4 ? 0 : 1;
-    const r = idx % 4;
-    const x = 24 + col * (colW + 20);
-    const y = 434 + r * rowH;
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#78716C';
+    ctx.font = `700 10px ${MONO}`;
+    ctx.fillText('MVP OF THE SESSION', cardX + 74, cardY + 26);
 
-    ctx.strokeStyle = 'rgba(10, 13, 18, 0.16)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(x, y + rowH - 4);
-    ctx.lineTo(x + colW, y + rowH - 4);
-    ctx.stroke();
+    ctx.fillStyle = '#1C1917';
+    ctx.font = `800 20px ${SANS}`;
+    ctx.fillText(mvp.player.name.slice(0, 10), cardX + 74, cardY + 52);
 
-    ctx.fillStyle = row.rank === 1 ? '#133EE6' : '#0A0D12';
-    ctx.font = 'italic 800 21px "Barlow Condensed", sans-serif';
-    ctx.fillText(String(row.rank).padStart(2, '0'), x, y + 25);
-
-    ctx.fillStyle = '#0A0D12';
-    ctx.font = '700 13.5px "Noto Sans SC", sans-serif';
-    ctx.fillText(row.player.name.slice(0, 6), x + 28, y + 20);
-
-    ctx.fillStyle = '#536073';
-    ctx.font = '500 10.5px "JetBrains Mono", monospace';
-    ctx.fillText(`${row.wins}W-${row.losses}L · ${row.player.rating.toFixed(1)}`, x + 28, y + 36);
+    ctx.fillStyle = '#57534E';
+    ctx.font = `500 11px ${SANS}`;
+    ctx.fillText(`${mvp.wins}胜 ${mvp.losses}负 · 胜率 ${Math.round(mvp.winRate * 100)}%`, cardX + 74, cardY + 70);
 
     ctx.textAlign = 'right';
-    ctx.fillStyle = row.pointDiff > 0 ? '#0E8A58' : row.pointDiff < 0 ? '#D93B26' : '#536073';
-    ctx.font = 'italic 800 19px "Barlow Condensed", monospace';
-    ctx.fillText(row.pointDiff > 0 ? `+${row.pointDiff}` : `${row.pointDiff}`, x + colW, y + 27);
-    ctx.textAlign = 'left';
+    ctx.fillStyle = '#1C1917';
+    ctx.font = `700 36px ${CONDENSED}`;
+    ctx.fillText(mvp.pointDiff >= 0 ? `+${mvp.pointDiff}` : `${mvp.pointDiff}`, cardX + cardW - 18, cardY + 54);
+  }
+  ctx.restore();
+
+  // 3. Polaroid Handwritten-Style Title & Whisper-Clean Caption
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#1C1917';
+  ctx.font = `700 22px ${SERIF}`;
+  ctx.fillText(copy.coverTitle.slice(0, 18), 30, 484);
+
+  ctx.fillStyle = '#78716C';
+  ctx.font = `500 12px ${SANS}`;
+  drawWrappedText(ctx, copy.mvpQuote, 30, 508, w - 60, 18, 2, 'left');
+
+  // 4. Minimalist Podium Strip (Top 4 avatars side-by-side in clean polaroid style)
+  const stripY = 562;
+  const topFour = standings.slice(0, 4);
+  const slotW = (w - 60) / Math.max(1, topFour.length);
+  topFour.forEach((row, idx) => {
+    const cx = 30 + slotW * idx + slotW / 2;
+    drawCircularAvatar(
+      ctx,
+      avatarImgs.get(row.player.id) ?? null,
+      cx,
+      stripY + 26,
+      24,
+      row.player.name,
+      idx === 0 ? '#C2410C' : '#292524',
+      '#FFFFFF',
+      idx === 0 ? '#D97757' : 'rgba(28, 25, 23, 0.14)',
+      2
+    );
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#1C1917';
+    ctx.font = `700 12.5px ${SANS}`;
+    ctx.fillText(row.player.name.slice(0, 4), cx, stripY + 70);
+
+    ctx.fillStyle = '#78716C';
+    ctx.font = `600 10.5px ${MONO}`;
+    ctx.fillText(
+      `#${row.rank} · ${row.pointDiff >= 0 ? `+${row.pointDiff}` : row.pointDiff}`,
+      cx,
+      stripY + 88
+    );
   });
 
-  // Authentic Swiss Ticket Barcode Footer
-  const barY = h - 72;
-  ctx.fillStyle = '#0A0D12';
-  const pattern = [2, 1, 3, 1, 1, 2, 4, 1, 2, 1, 1, 3, 2, 1, 2, 2, 1, 3, 1, 2, 1, 3, 1, 2, 2, 1];
-  let bx = 24;
-  pattern.forEach((units, i) => {
-    const bw = units * 2;
-    if (i % 2 === 0) {
-      ctx.fillRect(bx, barY, bw, 34);
-    }
-    bx += bw + 2;
-  });
+  // 5. Clean Archival Footer
+  ctx.strokeStyle = 'rgba(28, 25, 23, 0.1)';
+  ctx.beginPath();
+  ctx.moveTo(30, h - 54);
+  ctx.lineTo(w - 30, h - 54);
+  ctx.stroke();
+
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#78716C';
+  ctx.font = `500 11px ${SANS}`;
+  ctx.fillText(`${state.config.venue || '匹克球场'} · ${FORMAT_LABELS[state.config.format]}`, 30, h - 26);
 
   ctx.textAlign = 'right';
-  ctx.fillStyle = '#0A0D12';
-  ctx.font = '700 11px "JetBrains Mono", "Noto Sans SC", monospace';
-  ctx.fillText('轻转匹克 · ADMIT ONE', w - 24, barY + 14);
-  ctx.fillStyle = '#536073';
-  ctx.font = '500 10px "Noto Sans SC", sans-serif';
-  ctx.fillText((state.config.venue || '夜场硬地匹克球').slice(0, 18), w - 24, barY + 32);
-  ctx.textAlign = 'left';
+  ctx.fillStyle = '#1C1917';
+  ctx.font = `700 11px ${MONO}`;
+  ctx.fillText('轻转匹克', w - 30, h - 26);
+}
+
+function drawObsidianGoldPoster(
+  ctx: CanvasRenderingContext2D,
+  w: number,
+  h: number,
+  data: DrawPayload
+) {
+  const { standings, mvp, completedMatches, totalMatches, copy, dateLabel, heroImg, avatarImgs, state } = data;
+
+  // 1. Matte Obsidian Canvas
+  ctx.fillStyle = '#0F1115';
+  ctx.fillRect(0, 0, w, h);
+
+  // Subtle Champagne Gold Outer Hairline
+  ctx.strokeStyle = 'rgba(232, 201, 136, 0.32)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(18, 18, w - 36, h - 36);
+
+  // 2. Top Atmospheric Court Photo Fade (250px)
+  const photoH = 250;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(19, 19, w - 38, photoH);
+  ctx.clip();
+  if (heroImg) {
+    drawCoverImage(ctx, heroImg, 19, 19, w - 38, photoH);
+  }
+  const scrim = ctx.createLinearGradient(0, 19, 0, 19 + photoH);
+  scrim.addColorStop(0, 'rgba(15, 17, 21, 0.42)');
+  scrim.addColorStop(0.7, 'rgba(15, 17, 21, 0.72)');
+  scrim.addColorStop(1, '#0F1115');
+  ctx.fillStyle = scrim;
+  ctx.fillRect(19, 19, w - 38, photoH + 2);
+  ctx.restore();
+
+  // Gold Masthead
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#E8C988';
+  ctx.font = `700 10.5px ${MONO}`;
+  ctx.fillText(`CHAMPIONSHIP HONORS · ${dateLabel}`, w / 2, 52);
+
+  // Centered Editorial Title
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = `700 24px ${SERIF}`;
+  drawWrappedText(ctx, copy.coverTitle, w / 2, 92, w - 88, 32, 2, 'center');
+
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+  ctx.font = `500 11.5px ${SANS}`;
+  ctx.textAlign = 'center';
+  ctx.fillText(copy.coverSub.slice(0, 32), w / 2, 148);
+
+  // 3. Centered Champion Avatar Medallion overlapping horizon
+  if (mvp) {
+    drawCircularAvatar(
+      ctx,
+      avatarImgs.get(mvp.player.id) ?? null,
+      w / 2,
+      218,
+      40,
+      mvp.player.name,
+      '#1C1F26',
+      '#E8C988',
+      '#E8C988',
+      2.5
+    );
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#E8C988';
+    ctx.font = `700 10px ${MONO}`;
+    ctx.fillText('NO.01 · MVP CHAMPION', w / 2, 282);
+
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = `800 26px ${SANS}`;
+    ctx.fillText(mvp.player.name, w / 2, 314);
+
+    ctx.fillStyle = 'rgba(232, 201, 136, 0.9)';
+    ctx.font = `600 12px ${MONO}`;
+    ctx.fillText(
+      `${mvp.wins}W-${mvp.losses}L  ·  NET ${mvp.pointDiff >= 0 ? `+${mvp.pointDiff}` : mvp.pointDiff}  ·  ${Math.round(mvp.winRate * 100)}% WIN`,
+      w / 2,
+      338
+    );
+  }
+
+  // Subtle gold divider
+  ctx.strokeStyle = 'rgba(232, 201, 136, 0.28)';
+  ctx.beginPath();
+  ctx.moveTo(84, 360);
+  ctx.lineTo(w - 84, 360);
+  ctx.stroke();
+
+  // Centered Quote
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.78)';
+  ctx.font = `500 12px ${SERIF}`;
+  drawWrappedText(ctx, `“${copy.mvpQuote}”`, w / 2, 386, w - 92, 19, 2, 'center');
+
+  // 4. Clean Single-Column Luxury Top-5 Ranking
+  const listStart = 442;
+  const rows = standings.slice(0, 5);
+  rows.forEach((row, idx) => {
+    const y = listStart + idx * 50;
+
+    ctx.textAlign = 'left';
+    ctx.fillStyle = idx === 0 ? '#E8C988' : 'rgba(255, 255, 255, 0.45)';
+    ctx.font = `700 19px ${CONDENSED}`;
+    ctx.fillText(String(row.rank).padStart(2, '0'), 42, y + 25);
+
+    drawCircularAvatar(
+      ctx,
+      avatarImgs.get(row.player.id) ?? null,
+      90,
+      y + 19,
+      15,
+      row.player.name,
+      '#1F242D',
+      '#FFFFFF',
+      idx === 0 ? '#E8C988' : 'rgba(255,255,255,0.2)',
+      1.5
+    );
+
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = `700 14px ${SANS}`;
+    ctx.fillText(row.player.name.slice(0, 8), 118, y + 17);
+
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.55)';
+    ctx.font = `500 10.5px ${MONO}`;
+    ctx.fillText(`${row.wins}W-${row.losses}L · DUPR ${row.player.rating.toFixed(1)}`, 118, y + 33);
+
+    ctx.textAlign = 'right';
+    ctx.fillStyle = row.pointDiff > 0 ? '#E8C988' : row.pointDiff < 0 ? '#F87171' : '#94A3B8';
+    ctx.font = `700 20px ${CONDENSED}`;
+    ctx.fillText(row.pointDiff > 0 ? `+${row.pointDiff}` : `${row.pointDiff}`, w - 42, y + 25);
+
+    if (idx < rows.length - 1) {
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
+      ctx.beginPath();
+      ctx.moveTo(42, y + 44);
+      ctx.lineTo(w - 42, y + 44);
+      ctx.stroke();
+    }
+  });
+
+  // Footer
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(232, 201, 136, 0.7)';
+  ctx.font = `600 10px ${MONO}`;
+  ctx.fillText(
+    `${completedMatches}/${totalMatches} MATCHES · ${state.config.targetScore} PTS · 轻转匹克`,
+    w / 2,
+    h - 36
+  );
 }

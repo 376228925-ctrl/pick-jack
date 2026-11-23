@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AiMatchmakeSheet } from './components/AiMatchmakeSheet';
 import { BottomNav } from './components/BottomNav';
 import { CloudSyncSheet } from './components/CloudSyncSheet';
@@ -33,6 +33,12 @@ import {
   saveUsers,
   updateUserRoleByAdmin,
 } from './utils/authStore';
+import { buildAvatarLookup } from './utils/avatarUtils';
+import {
+  computeClubSyncSignature,
+  mergeClubSessions,
+  mergeClubUsers,
+} from './utils/clubSyncMerge';
 import {
   loadCareerMemory,
   recordCompletedMatchesToMemory,
@@ -99,6 +105,7 @@ export default function App() {
   const [scoringMatchId, setScoringMatchId] = useState<string | null>(null);
   const [previewMatchId, setPreviewMatchId] = useState<string | null>(null);
   const [reportOpen, setReportOpen] = useState(false);
+  const [posterSpotlightPlayerId, setPosterSpotlightPlayerId] = useState<string | null>(null);
   const [cloudSyncOpen, setCloudSyncOpen] = useState(false);
   const [aiMatchmakeOpen, setAiMatchmakeOpen] = useState(false);
   const [careerMemory, setCareerMemory] = useState<CareerMemoryMap>(() => loadCareerMemory());
@@ -112,6 +119,12 @@ export default function App() {
     }
   });
   const [toast, setToast] = useState<string | null>(null);
+  const [cloudSyncStatus, setCloudSyncStatus] = useState<
+    'idle' | 'syncing' | 'synced' | 'local_only'
+  >('idle');
+  const [cloudHydrated, setCloudHydrated] = useState(false);
+
+  const avatarsByName = useMemo(() => buildAvatarLookup(users), [users]);
 
   const state: TournamentState = useMemo(
     () => sessions.find((s) => s.id === activeSessionId) ?? sessions[0],
@@ -161,6 +174,287 @@ export default function App() {
     saveTheme(activeTheme);
     document.documentElement.setAttribute('data-theme', activeTheme);
   }, [activeTheme]);
+
+  const usersRef = useRef<UserAccount[]>(users);
+  const sessionsRef = useRef<TournamentState[]>(sessions);
+  const lastSyncedSigRef = useRef<string>('');
+  const kvUnavailableRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    usersRef.current = users;
+  }, [users]);
+
+  useEffect(() => {
+    sessionsRef.current = sessions;
+  }, [sessions]);
+
+  const applyMergedClubState = useCallback(
+    (cloudUsers?: UserAccount[], cloudSessions?: TournamentState[]) => {
+      const nextUsers =
+        Array.isArray(cloudUsers) && cloudUsers.length > 0
+          ? mergeClubUsers(usersRef.current, cloudUsers)
+          : usersRef.current;
+      const nextSessions =
+        Array.isArray(cloudSessions) && cloudSessions.length > 0
+          ? mergeClubSessions(sessionsRef.current, cloudSessions)
+          : sessionsRef.current;
+
+      const nextSig = computeClubSyncSignature(nextUsers, nextSessions);
+      lastSyncedSigRef.current = nextSig;
+
+      if (computeClubSyncSignature(usersRef.current, []) !== computeClubSyncSignature(nextUsers, [])) {
+        usersRef.current = nextUsers;
+        setUsers(nextUsers);
+      }
+      if (
+        computeClubSyncSignature([], sessionsRef.current) !==
+        computeClubSyncSignature([], nextSessions)
+      ) {
+        sessionsRef.current = nextSessions;
+        setSessions(nextSessions);
+      }
+      return { users: nextUsers, sessions: nextSessions };
+    },
+    []
+  );
+
+  // Immediately push club users & sessions to cloud (/api/club-data) with server-side conflict-safe merge
+  const pushClubToCloud = useCallback(
+    async (
+      nextUsers: UserAccount[],
+      nextSessions: TournamentState[]
+    ): Promise<{ ok: boolean; storageMode?: string }> => {
+      if (kvUnavailableRef.current) {
+        return { ok: false, storageMode: 'local_only' };
+      }
+      try {
+        const res = await fetch('/api/club-data', {
+          method: 'PUT',
+          cache: 'no-store',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ users: nextUsers, sessions: nextSessions }),
+        });
+        const data = (await res.json().catch(() => ({}))) as {
+          ok?: boolean;
+          storageMode?: string;
+          users?: UserAccount[];
+          sessions?: TournamentState[];
+        };
+        if (res.status === 503 && data.storageMode === 'local_only') {
+          kvUnavailableRef.current = true;
+          setCloudSyncStatus('local_only');
+          return { ok: false, storageMode: 'local_only' };
+        }
+        if (!res.ok || !data.ok) {
+          return { ok: false };
+        }
+        applyMergedClubState(data.users ?? nextUsers, data.sessions ?? nextSessions);
+        setCloudSyncStatus('synced');
+        return { ok: true, storageMode: data.storageMode };
+      } catch {
+        return { ok: false };
+      }
+    },
+    [applyMergedClubState]
+  );
+
+  // Pull shared club accounts, avatars & calendar sessions from cloud (/api/club-data) with no-cache busting
+  const syncClubFromCloud = useCallback(
+    async (silent = false): Promise<UserAccount[]> => {
+      if (!silent) {
+        setCloudSyncStatus('syncing');
+      }
+      try {
+        const res = await fetch(`/api/club-data?_t=${Date.now()}`, {
+          cache: 'no-store',
+        });
+        const data = (await res.json().catch(() => ({}))) as {
+          ok?: boolean;
+          empty?: boolean;
+          storageMode?: string;
+          users?: UserAccount[];
+          sessions?: TournamentState[];
+        };
+
+        if (res.status === 503 && data.storageMode === 'local_only') {
+          kvUnavailableRef.current = true;
+          setCloudSyncStatus('local_only');
+          setCloudHydrated(true);
+          if (!silent) {
+            setToast('云端 KV 尚未绑定，当前仅保存在本机浏览器');
+          }
+          return usersRef.current;
+        }
+
+        if (!res.ok || !data.ok) {
+          setCloudHydrated(true);
+          if (!silent) {
+            setToast('云端暂时连接波动，稍后将自动重试同步');
+          }
+          return usersRef.current;
+        }
+
+        kvUnavailableRef.current = false;
+
+        if (data.empty) {
+          // First-time cloud initialization: seed cloud immediately with current local state
+          await pushClubToCloud(usersRef.current, sessionsRef.current);
+          setCloudSyncStatus('synced');
+          if (!silent) {
+            setToast('已初始化云端俱乐部数据库并完成同步');
+          }
+          return usersRef.current;
+        }
+
+        const merged = applyMergedClubState(data.users, data.sessions);
+        // If local phone had newer/extra registrations that cloud didn't have yet, push them right back
+        const cloudOnlySig = computeClubSyncSignature(data.users ?? [], data.sessions ?? []);
+        const mergedSig = computeClubSyncSignature(merged.users, merged.sessions);
+        if (cloudOnlySig !== mergedSig) {
+          void pushClubToCloud(merged.users, merged.sessions);
+        }
+
+        setCloudSyncStatus('synced');
+        if (!silent) {
+          setToast(`已同步云端最新数据（共 ${merged.users.length} 位注册球友）`);
+        }
+        return merged.users;
+      } catch {
+        if (!silent) {
+          setToast('网络波动，暂未拉取到最新云端数据');
+        }
+        return usersRef.current;
+      } finally {
+        setCloudHydrated(true);
+      }
+    },
+    [applyMergedClubState, pushClubToCloud]
+  );
+
+  useEffect(() => {
+    void syncClubFromCloud(true);
+  }, [syncClubFromCloud]);
+
+  // Automatic 8-second live multi-phone polling + immediate pull when tab returns to foreground
+  useEffect(() => {
+    if (!cloudHydrated) return;
+    const pollId = window.setInterval(() => {
+      if (kvUnavailableRef.current) return;
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      void syncClubFromCloud(true);
+    }, 8000);
+
+    const handleVisibilityOrFocus = () => {
+      if (kvUnavailableRef.current) return;
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        void syncClubFromCloud(true);
+      }
+    };
+    window.addEventListener('focus', handleVisibilityOrFocus);
+    document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+
+    return () => {
+      window.clearInterval(pollId);
+      window.removeEventListener('focus', handleVisibilityOrFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
+    };
+  }, [cloudHydrated, syncClubFromCloud]);
+
+  // Auto-push updated club accounts/avatars & calendar sessions ONLY when local data actually changed
+  useEffect(() => {
+    if (!cloudHydrated || kvUnavailableRef.current) return;
+    const currentSig = computeClubSyncSignature(users, sessions);
+    if (currentSig === lastSyncedSigRef.current) return;
+
+    const timer = window.setTimeout(() => {
+      void pushClubToCloud(users, sessions);
+    }, 550);
+    return () => window.clearTimeout(timer);
+  }, [users, sessions, cloudHydrated, pushClubToCloud]);
+
+  // Listen for WeChat OAuth2 callback (popup postMessage or redirect sessionStorage)
+  useEffect(() => {
+    const applyWeChatProfile = (profile: {
+      openid: string;
+      nickname: string;
+      avatarUrl?: string;
+      gender?: Gender;
+    }) => {
+      if (activeUserId) {
+        setUsers((prev) =>
+          prev.map((u) =>
+            u.id === activeUserId
+              ? {
+                  ...u,
+                  displayName: profile.nickname || u.displayName,
+                  avatarUrl: profile.avatarUrl || u.avatarUrl,
+                  gender: profile.gender || u.gender,
+                }
+              : u
+          )
+        );
+        setToast(`已同步微信头像与昵称：${profile.nickname}`);
+      } else {
+        const wxUsername = `wx_${profile.openid.slice(-8)}`;
+        setUsers((prev) => {
+          const existing = prev.find((u) => u.username === wxUsername);
+          if (existing) {
+            setActiveUserId(existing.id);
+            return prev.map((u) =>
+              u.id === existing.id
+                ? {
+                    ...u,
+                    displayName: profile.nickname || u.displayName,
+                    avatarUrl: profile.avatarUrl || u.avatarUrl,
+                  }
+                : u
+            );
+          }
+          const created: UserAccount = {
+            id: `u-wx-${profile.openid.slice(-10)}`,
+            username: wxUsername,
+            passwordHash: '',
+            role: 'member',
+            displayName: profile.nickname || '微信球友',
+            avatarUrl: profile.avatarUrl,
+            gender: profile.gender || 'U',
+            dupr: 3.5,
+            handedness: 'right',
+            playStyle: '均衡全能型',
+            bio: '微信一键授权认证球友',
+            createdAt: Date.now(),
+          };
+          setActiveUserId(created.id);
+          return [...prev, created];
+        });
+        setToast(`微信登录成功，欢迎 ${profile.nickname}`);
+      }
+    };
+
+    try {
+      const pending = window.sessionStorage.getItem('qingzhuan_wechat_pending');
+      if (pending) {
+        window.sessionStorage.removeItem('qingzhuan_wechat_pending');
+        const parsed = JSON.parse(pending) as {
+          type?: string;
+          profile?: { openid: string; nickname: string; avatarUrl?: string; gender?: Gender };
+        };
+        if (parsed.type === 'WECHAT_AUTH_SUCCESS' && parsed.profile) {
+          applyWeChatProfile(parsed.profile);
+        }
+      }
+    } catch {
+      // Ignore storage error
+    }
+
+    const onMsg = (event: MessageEvent) => {
+      if (event.data?.type === 'WECHAT_AUTH_SUCCESS' && event.data?.profile) {
+        applyWeChatProfile(event.data.profile);
+      }
+    };
+    window.addEventListener('message', onMsg);
+    return () => window.removeEventListener('message', onMsg);
+  }, [activeUserId]);
 
   const showToast = useCallback((message: string) => {
     setToast(message);
@@ -660,16 +954,21 @@ export default function App() {
     [updateCurrentSession, showToast]
   );
 
-  // Auth & RBAC handlers
+  // Auth & RBAC handlers (with immediate cloud persistence & cross-device lookup)
   const handleLogin = useCallback(
-    (username: string, password: string) => {
-      const res = authenticateUser(users, username, password);
+    async (username: string, password: string) => {
+      let res = authenticateUser(usersRef.current, username, password);
+      if (!res.ok) {
+        // Pull fresh cloud accounts once in case the user just registered on another phone
+        const freshUsers = await syncClubFromCloud(true);
+        res = authenticateUser(freshUsers, username, password);
+      }
       if (!res.ok) return res;
       setActiveUserId(res.user.id);
       showToast(`欢迎回来，${res.user.displayName}`);
       return { ok: true };
     },
-    [users, showToast]
+    [syncClubFromCloud, showToast]
   );
 
   const handleRegister = useCallback(
@@ -680,14 +979,22 @@ export default function App() {
       gender: Gender;
       dupr: number;
     }) => {
-      const res = registerNewAccount(users, input);
+      const res = registerNewAccount(usersRef.current, input);
       if (!res.ok) return res;
+      usersRef.current = res.nextUsers;
       setUsers(res.nextUsers);
       setActiveUserId(res.user.id);
-      showToast(`已创建球手档案：${res.user.displayName}`);
+      showToast(`已创建球手档案：${res.user.displayName}，正在同步上云…`);
+      void pushClubToCloud(res.nextUsers, sessionsRef.current).then((pushed) => {
+        if (pushed.ok) {
+          showToast(`球手「${res.user.displayName}」已成功同步至云端数据库`);
+        } else if (pushed.storageMode === 'local_only') {
+          showToast(`已创建本地档案：${res.user.displayName}（当前环境未绑定云端 KV）`);
+        }
+      });
       return { ok: true };
     },
-    [users, showToast]
+    [pushClubToCloud, showToast]
   );
 
   const handleLogout = useCallback(() => {
@@ -697,33 +1004,40 @@ export default function App() {
 
   const handleUpdateProfile = useCallback(
     (patch: {
-      displayName: string;
-      gender: Gender;
-      dupr: number;
-      handedness: 'right' | 'left';
-      playStyle: string;
-      bio: string;
+      displayName?: string;
+      avatarUrl?: string;
+      gender?: Gender;
+      dupr?: number;
+      handedness?: 'right' | 'left';
+      playStyle?: string;
+      bio?: string;
     }) => {
       if (!activeUserId) return;
-      setUsers((prev) =>
-        prev.map((u) => (u.id === activeUserId ? { ...u, ...patch } : u))
+      const now = Date.now();
+      const nextUsers = usersRef.current.map((u) =>
+        u.id === activeUserId ? { ...u, ...patch, updatedAt: now } : u
       );
-      showToast('个人档案已更新');
+      usersRef.current = nextUsers;
+      setUsers(nextUsers);
+      void pushClubToCloud(nextUsers, sessionsRef.current);
+      showToast(patch.avatarUrl ? '个人头像已更新并同步上云' : '个人档案已更新并同步上云');
     },
-    [activeUserId, showToast]
+    [activeUserId, pushClubToCloud, showToast]
   );
 
   const handleToggleUserAdmin = useCallback(
     (targetUserId: string, nextRole: 'admin' | 'member') => {
-      const res = updateUserRoleByAdmin(users, currentUser, targetUserId, nextRole);
+      const res = updateUserRoleByAdmin(usersRef.current, currentUser, targetUserId, nextRole);
       if (!res.ok) {
         showToast(res.error);
         return;
       }
+      usersRef.current = res.nextUsers;
       setUsers(res.nextUsers);
-      showToast(nextRole === 'admin' ? '已授权为赛事管理员' : '已取消管理员权限');
+      void pushClubToCloud(res.nextUsers, sessionsRef.current);
+      showToast(nextRole === 'admin' ? '已授权为赛事管理员并同步上云' : '已取消管理员权限并同步上云');
     },
-    [users, currentUser, showToast]
+    [currentUser, pushClubToCloud, showToast]
   );
 
   return (
@@ -750,7 +1064,10 @@ export default function App() {
         currentUser={currentUser}
         onSelectTab={setActiveTab}
         onOpenThemeSwitcher={() => setThemeModalOpen(true)}
-        onOpenReport={() => setReportOpen(true)}
+        onOpenReport={() => {
+          setPosterSpotlightPlayerId(null);
+          setReportOpen(true);
+        }}
         rosterDirty={state.rosterDirty}
       />
 
@@ -761,6 +1078,8 @@ export default function App() {
             sessions={sessions}
             activeTheme={activeTheme}
             currentUser={currentUser}
+            avatarsByName={avatarsByName}
+            cloudSyncStatus={cloudSyncStatus}
             standings={standings}
             fairness={fairness}
             activeRoundNumber={activeRoundNumber}
@@ -787,9 +1106,17 @@ export default function App() {
             standings={standings}
             fairness={fairness}
             playerMap={playerMap}
+            avatarsByName={avatarsByName}
             completedMatches={completedMatches}
             totalMatches={totalMatches}
-            onOpenReport={() => setReportOpen(true)}
+            onOpenReport={() => {
+              setPosterSpotlightPlayerId(null);
+              setReportOpen(true);
+            }}
+            onOpenPlayerPoster={(playerId) => {
+              setPosterSpotlightPlayerId(playerId);
+              setReportOpen(true);
+            }}
           />
         )}
 
@@ -797,6 +1124,11 @@ export default function App() {
           <PlayersView
             state={state}
             players={state.players}
+            registeredUsers={users}
+            cloudSyncStatus={cloudSyncStatus}
+            onSyncClubCloud={() => {
+              void syncClubFromCloud(false);
+            }}
             standings={standings}
             careerMemory={careerMemory}
             playedCountByPlayer={playedCountByPlayer}
@@ -833,6 +1165,8 @@ export default function App() {
             allUsers={users}
             sessions={sessions}
             activeTheme={activeTheme}
+            cloudSyncStatus={cloudSyncStatus}
+            onSyncClubCloud={() => syncClubFromCloud(false)}
             onSelectTheme={(id) => {
               setActiveTheme(id);
               showToast(`已切换至「${getThemeConfig(id).name}」实景主题`);
@@ -860,6 +1194,7 @@ export default function App() {
       <ScoreSheet
         match={scoringMatch}
         playerMap={playerMap}
+        avatarsByName={avatarsByName}
         targetScore={state.config.targetScore}
         winByTwo={state.config.winByTwo}
         onClose={() => setScoringMatchId(null)}
@@ -881,7 +1216,12 @@ export default function App() {
         standings={standings}
         fairness={fairness}
         heroImageUrl={themeCfg.bgImage}
-        onClose={() => setReportOpen(false)}
+        avatarsByName={avatarsByName}
+        initialSpotlightPlayerId={posterSpotlightPlayerId}
+        onClose={() => {
+          setReportOpen(false);
+          setPosterSpotlightPlayerId(null);
+        }}
       />
 
       <CloudSyncSheet
@@ -917,7 +1257,7 @@ export default function App() {
         <div
           role="status"
           aria-live="polite"
-          className="fixed bottom-20 md:bottom-6 left-1/2 -translate-x-1/2 z-50 px-4 py-2.5 rounded-xl theme-accent-bg text-xs sm:text-sm font-bold shadow-xl whitespace-nowrap"
+          className="fixed top-16 left-1/2 -translate-x-1/2 z-40 px-4 py-2 rounded-xl theme-accent-bg text-xs sm:text-sm font-bold shadow-xl whitespace-nowrap pointer-events-none"
         >
           {toast}
         </div>

@@ -3,6 +3,7 @@ import {
   AlertCircle,
   Check,
   ClipboardPaste,
+  Cloud,
   History,
   Loader2,
   Minus,
@@ -20,7 +21,10 @@ import type {
   Player,
   PlayerStanding,
   TournamentState,
+  UserAccount,
 } from '../types/tournament';
+import { getRoleLabel } from '../utils/authStore';
+import { resolvePlayerAvatar } from '../utils/avatarUtils';
 import {
   buildCalibrationPayload,
   type AnalyzeApiResponse,
@@ -36,6 +40,9 @@ import { WeChatImportSheet } from './WeChatImportSheet';
 interface PlayersViewProps {
   state: TournamentState;
   players: Player[];
+  registeredUsers?: UserAccount[];
+  cloudSyncStatus?: 'idle' | 'syncing' | 'synced' | 'local_only';
+  onSyncClubCloud?: () => void;
   standings: PlayerStanding[];
   careerMemory: CareerMemoryMap;
   playedCountByPlayer: Map<string, number>;
@@ -53,6 +60,9 @@ interface PlayersViewProps {
 export function PlayersView({
   state,
   players,
+  registeredUsers = [],
+  cloudSyncStatus = 'idle',
+  onSyncClubCloud,
   standings,
   careerMemory,
   playedCountByPlayer,
@@ -274,6 +284,104 @@ export function PlayersView({
             <span>智能重排未赛轮次</span>
           </button>
         </div>
+      )}
+
+      {/* Registered Club Members Directory (Synced via Cloud KV) */}
+      {registeredUsers.length > 0 && (
+        <section className="bg-[#111620] rounded-3xl border border-white/[0.08] p-4 sm:p-5 space-y-3.5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <div className="flex items-center gap-2">
+                <Cloud className="w-4 h-4 text-[#D4FF2B]" aria-hidden="true" />
+                <h2 className="text-sm sm:text-base font-bold text-[#F4F7FB]">
+                  俱乐部已注册球友（云端实时名单）
+                </h2>
+                <span className="text-xs font-mono tabular-nums text-[#8E9AB2]">
+                  {registeredUsers.length} 人
+                </span>
+              </div>
+              <p className="text-xs text-[#8E9AB2] mt-0.5">
+                朋友在任意手机注册后自动上云汇总于此，点击即可一键拉入本场名单。
+              </p>
+            </div>
+
+            {onSyncClubCloud && (
+              <button
+                type="button"
+                onClick={onSyncClubCloud}
+                disabled={cloudSyncStatus === 'syncing'}
+                className="min-h-[36px] px-3 rounded-xl bg-white/[0.07] hover:bg-white/[0.14] border border-white/[0.08] text-xs font-semibold text-[#F4F7FB] inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+              >
+                <RefreshCw
+                  className={`w-3.5 h-3.5 text-[#D4FF2B] ${
+                    cloudSyncStatus === 'syncing' ? 'animate-spin' : ''
+                  }`}
+                  aria-hidden="true"
+                />
+                <span>{cloudSyncStatus === 'syncing' ? '同步中…' : '刷新云端名单'}</span>
+              </button>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
+            {registeredUsers.map((u) => {
+              const alreadyInRoster = players.some(
+                (p) =>
+                  p.name.trim().toLowerCase() === u.displayName.trim().toLowerCase() ||
+                  p.name.trim().toLowerCase() === u.username.trim().toLowerCase()
+              );
+              return (
+                <div
+                  key={u.id}
+                  className="p-3 rounded-2xl bg-[#0A0E16] border border-white/[0.08] flex items-center justify-between gap-2.5"
+                >
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <img
+                      src={resolvePlayerAvatar(u.displayName, u.avatarUrl)}
+                      alt={u.displayName}
+                      className="w-9 h-9 rounded-full object-cover shrink-0 border border-white/15"
+                    />
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-xs sm:text-sm font-bold text-[#F4F7FB] truncate">
+                          {u.displayName}
+                        </span>
+                        <span className="text-[11px] font-mono text-[#7D8AA3] truncate">
+                          @{u.username}
+                        </span>
+                      </div>
+                      <div className="text-[11px] font-mono text-[#8E9AB2] mt-0.5">
+                        DUPR {u.dupr.toFixed(1)} · {getRoleLabel(u.role)}
+                      </div>
+                    </div>
+                  </div>
+
+                  {alreadyInRoster ? (
+                    <span className="text-[11px] font-semibold text-[#22D38B] inline-flex items-center gap-1 shrink-0">
+                      <Check className="w-3.5 h-3.5" aria-hidden="true" />
+                      <span>已参赛</span>
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onAddPlayer({
+                          name: u.displayName,
+                          gender: u.gender,
+                          rating: u.dupr,
+                        })
+                      }
+                      className="min-h-[34px] px-2.5 rounded-xl bg-[#D4FF2B] text-[#080B10] text-xs font-bold hover:bg-[#E1FF61] active:scale-[0.97] transition-all inline-flex items-center gap-1 whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      <Plus className="w-3.5 h-3.5" aria-hidden="true" />
+                      <span>加入本场</span>
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </section>
       )}
 
       {/* Main Split: Left Roster List + Right Quick Add Panel */}

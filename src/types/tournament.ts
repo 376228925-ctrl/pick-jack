@@ -20,17 +20,20 @@ export interface UserAccount {
   passwordHash: string;
   role: UserRole;
   displayName: string;
+  avatarUrl?: string;
   gender: Gender;
   dupr: number;
   handedness: 'right' | 'left';
   playStyle: string;
   bio: string;
   createdAt: number;
+  updatedAt?: number;
 }
 
 export interface Player {
   id: string;
   name: string;
+  avatarUrl?: string;
   gender: Gender;
   rating: number; // DUPR-style 2.0 - 5.5
   active: boolean; // false = paused / left mid-tournament
